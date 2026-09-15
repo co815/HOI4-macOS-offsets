@@ -3,7 +3,7 @@
 
 Handover document for a new session. Covers everything reverse-engineered so far on Hearts of Iron IV, macOS x86_64 running under Rosetta 2, plus what failed and why.
 
-Working files: `memory.hpp`, `hoi4_offsets.hpp`, `hoi4_sdk.hpp`, `trainer.cpp`, `poke.cpp`, `valfind` (scanner). Offsets have their derivation notes directly inside `hoi4_offsets.hpp`.
+Working files: `memory.hpp`, `hoi4_offsets.hpp`, `hoi4_sdk.hpp`, `trainer.cpp`, `offset_scanner.cpp` (automated updater), `poke.cpp`, `buildings.cpp`, `divwatch.cpp`. Offsets have their derivation notes directly inside `hoi4_offsets.hpp`.
 
 The ASLR slide was 0 in all sessions, but it is recalculated on every launch.
 
@@ -26,6 +26,12 @@ The ASLR slide was 0 in all sessions, but it is recalculated on every launch.
 | l | add_latest_equipment |
 | p | production lines (read-only) |
 | n | naval object address (diagnostic) |
+| d | divisions (perpetual 100% Org lock, 100% HP invulnerability, scaled veterancy, crash-free) |
+| t | switch country tag (control another country / troll mode, with original country restore) |
+| i | enable developer console in Ironman & Multiplayer (keeps Ironman flag & achievements 100% active) |
+| g | military leaders (generals, marshals, admirals XP / sub-skills, custom attack/defense/planning/logistics, role preservation) |
+| a | intelligence agency & operations (La Résistance godmode: instant 0-day upgrades, 100% intel network, instant operations, operative immunity) |
+| m | doctrines & subdoctrines (instant unlocks, subdoctrine branch maxing, 500 military XP refill) |
 
 ---
 
@@ -35,6 +41,8 @@ The ASLR slide was 0 in all sessions, but it is recalculated on every launch.
 
 ```
 imageBase + 0x3501220     → GameState
+  + 0x0A8   uint32 flags (bit 0 = 1 if Ironman mode is active)
+  + 0x308   → int32[] tag-to-internal-index translation table
   + 0x4D8   int32  player tag (primary)
   + 0x4DC   int32  fallback tag
   + 0x2D8   → Country*[]
@@ -53,6 +61,8 @@ country = sub_1011D3D20(rdi);
 ### Country
 
 ```
+Country + 0x10     std::string tag (e.g. "GER", "ROM", "SOV")
+Country + 0x40     std::string country name / token (e.g. "Germany")
 Country + 0x1B0    int64  command power, /100000
 Country + 0x1B8    int64  ceiling deduction (negative = raises ceiling)
 Country + 0x420    → State*[] owned
@@ -791,3 +801,481 @@ Relevant macOS Mach Virtual Memory APIs: `task_for_pid`, `mach_vm_region_recurse
 **Experimentation on Polluted State:** Sequential memory writes corrupted building grids, making it impossible to distinguish genuine game state from experimental debris. Diagnostic experiments must be executed against clean game saves, isolating one variable per run.
 
 **Interference from Running Simulation:** Damaged buildings gradually decay during active play. Multiple tests conducted while unpaused produced false conclusions because values fluctuated due to simulation decay rather than our writes. Pausing the game engine is mandatory during diagnostic verification.
+
+---
+
+## 18. Country Tag Switching & Multi-Country Control
+
+### Resolution & Mechanics
+In Hearts of Iron IV, the player's controlled country is not hardcoded to a specific struct pointer; instead, it is resolved on every frame and tick from `GameState`:
+
+```c
+rdi = GameState + 0x4DC;
+if (*(GameState + 0x4D8) > 0) rdi = GameState + 0x4D8;
+int32_t tag = *rdi;
+int32_t index = tagIndexTable[tag];
+Country* playerCountry = countryArray[index];
+```
+
+- `GameState + 0x4D8`: Primary player country tag integer (e.g. 1 for Germany, 2 for France, etc.).
+- `GameState + 0x4DC`: Fallback country tag integer.
+- `GameState + 0x308`: Tag-to-internal-index translation table pointer (`int32_t*`). The index into the table is `tag`, and the value stored is the index in `countryArray`.
+- `GameState + 0x2D8`: Pointer array to all instantiated `Country*` objects.
+
+### Country Metadata
+Inside each `Country` object:
+- `Country + 0x10`: Tag string (`std::string`, e.g. `"GER"`, `"ROM"`, `"SOV"`).
+- `Country + 0x40`: Country name token / string (`std::string`, e.g. `"Germany"`, `"Kingdom of Romania"`).
+- `Country + 0x42C`: Number of owned states (`int32`).
+
+### Tag Switching & Troll Mode
+By updating both `GameState + 0x4D8` and `GameState + 0x4DC` simultaneously:
+1. The game immediately shifts keyboard/mouse control, diplomatic views, production UI, and military commands to the new tag.
+2. The trainer automatically recognizes the new country, refocusing all cheat menus (manpower, equipment, research, nukes, etc.) to the target nation.
+3. The trainer stores `g_originalTag` so the player can switch between trolling AI nations and controlling their own country at will with a single keypress (`o`).
+4. If the background `DivisionFreeze` thread is running, it is notified via `notifyCountryChanged()` so division godmode transfers seamlessly to the currently selected tag.
+
+---
+
+## 19. Ironman & Multiplayer Console Unlock, Developer Commands & Achievement Integrity
+
+### The Vanilla Console Blocker
+In vanilla HOI4, opening the developer console (`~` / `§` / `` ` ``) and executing commands is prohibited in Ironman and multiplayer sessions.
+
+The blocking mechanism consists of two independent checks in `CConsoleCmdManager`:
+
+1. **Keybind / Window Toggle Gate (`0x100765E4C`):**
+   When the console shortcut key is pressed, the event handler queries `CConsoleCmdManager::IsConsoleAvailable()` (`0x102A520D0`):
+   ```asm
+   100765e49: movq (%rax), %rdi         ; CConsoleCmdManager instance (from 0x1035c80f0)
+   100765e4c: callq 0x102a520d0         ; CConsoleCmdManager::IsConsoleAvailable()
+   100765e51: testb %al, %al
+   100765e53: je 0x1007662f2            ; If false -> ABORT (do not open GUI window!)
+   100765e59: movq %r15, %rdi
+   100765e5c: callq 0x1025059d0         ; CConsole::Toggle() / Show window
+   ```
+   Inside `IsConsoleAvailable` (`0x102A520D0`):
+   ```cpp
+   bool CConsoleCmdManager::IsConsoleAvailable() {
+       if (!_IsRelease()) return true;
+       if (_IsMultiplayer()) return false;
+       return !_IsIronMan();
+   }
+   ```
+   In an Ironman save or multiplayer session, `_IsIronMan()` or `_IsMultiplayer()` returns `1`, causing `IsConsoleAvailable()` to return `0` (false), which blocks the console window from appearing.
+
+2. **Command Execution Gate (`0x102A52260` - `CConsoleCmdManager::Execute`):**
+   Even if the console window was forced open, `CConsoleCmdManager::Execute` validates whether the session is allowed to run commands:
+   ```asm
+   102a5228a: movq 0x40(%rsi), %rdi     ; _IsRelease callback
+   ...
+   102a522a5: je 0x102a522f6            ; If not release, jump directly to command execution!
+   102a522a7: movq 0xa0(%rbx), %rdi    ; _IsMultiplayer callback
+   ...
+   102a522bf: jne 0x102a522d8           ; If multiplayer, block command!
+   102a522c1: movq 0x70(%rbx), %rdi     ; _IsIronMan callback
+   ...
+   102a522d4: testb %al, %al
+   102a522d6: je 0x102a522f6            ; If not ironman, jump to command execution!
+   102a522d8: movb $0x0, (%r12)
+   102a522dd: leaq 0x755eea(%rip), %rsi ; "Console not available in multiplayer or ironman mode."
+   ```
+   Furthermore, developer-only commands check `_IsRelease()` at `0x102A52445` and fail with `"Command available only for developers."` if `_IsRelease()` returns true.
+
+### The `deironman` Command Trap
+HOI4 contains a built-in console command named `deironman` (`sub_10013A100`).
+Disassembly reveals its exact operation:
+```asm
+movq 0x3501220(%rip), %rax           ; GameState*
+andl $-0x2, 0xa8(%rax)                ; Clear bit 0 of GameState + 0xA8
+leaq "Unset Ironman status...", %rsi
+```
+Clearing bit 0 of `GameState + 0xA8` turns off the Ironman state on the active save file. **This permanently invalidates Steam Achievement eligibility.** Any solution that relies on clearing the Ironman flag destroys the player's ability to earn achievements.
+
+### Safe Solution: In-Memory Code Patching
+To enable the console in both Ironman and Multiplayer without losing achievements, we leave `GameState + 0xA8` bit 0 completely untouched and patch the validation logic in the `__TEXT` segment at runtime:
+
+| Function / Check | Static Address | Original Opcodes | Patched Opcodes | Purpose |
+|---|---|---|---|---|
+| `CConsoleCmdManager::IsConsoleAvailable()` | `0x102A520D0` | `55 48 89 e5 53 50` | `b8 01 00 00 00 c3` (`mov $1, %eax; retq`) | Forces keybind handler to always allow toggling console window in Ironman & MP |
+| Keybind Event Gate (`CConsole::Toggle`) | `0x100765E53` | `0f 84 99 04 00 00` (`je 0x1007662f2`) | `90 90 90 90 90 90` (`nop * 6`) | Forces keyboard handler to ALWAYS invoke `CConsole::Toggle()` when hotkey is pressed |
+| `CConsoleCmdManager::Execute` (Release branch) | `0x102A522A5` | `74 4f` (`je 0x102a522f6`) | `eb 4f` (`jmp 0x102a522f6`) | Unconditionally jumps straight to command execution, skipping all MP/Ironman/Release checks |
+| `CConsoleCmdManager::Execute` (Multiplayer branch) | `0x102A522BF` | `75 17` (`jne 0x102a522d8`) | `90 90` (`nop nop`) | Disables the multiplayer error jump |
+| `CConsoleCmdManager::Execute` (Ironman branch) | `0x102A522D6` | `74 1e` (`je 0x102a522f6`) | `eb 1e` (`jmp 0x102a522f6`) | Bypasses Ironman rejection |
+| `CConsoleCmdManager::Execute` (Dev-only branch) | `0x102A5244B` | `74 11` (`je 0x102a5245e`) | `eb 11` (`jmp 0x102a5245e`) | Unlocks developer-only console commands |
+
+### Multiplayer & Lockstep Networking Note
+In Hearts of Iron IV, multiplayer operates via deterministic lockstep simulation:
+- **Client-side & Informational Commands:** Commands that toggle client-side visual states, debugging overlays, or reload assets work seamlessly in multiplayer without triggering desyncs (e.g. `fow` for fog of war, `observe`, `togglegui`, `debug_mode`, `reload`, `nudge`, `weather`).
+- **Simulation-altering Commands:** Commands that directly modify local gamestate entities (e.g. `manpower`, `tag`, `annex`, `add_equipment`, `research all`) will alter the local simulation hash. At the end of the simulation day tick, this divergence triggers an Out-of-Sync (OOS) dialog among connected clients.
+
+### Why Steam Achievements Remain Active
+Steam achievement qualification in Clausewitz engine games requires:
+1. `GameState + 0xA8` (bit 0 = 1): Ironman mode active.
+2. Valid checksum or permitted game rule modifications.
+3. Save file flagged with Ironman metadata.
+
+Because our patch operates purely on the execution gates of the console manager and **never modifies `GameState + 0xA8`**, the engine continually reports to Steam that the game is running as an authentic Ironman session. All achievements trigger normally when requirements are satisfied.
+
+---
+
+## 20. Mach-O `__TEXT` Runtime Code Patching on macOS
+
+Modifying executable code pages in macOS (`__TEXT` segment) via Mach kernel APIs presents specific constraints under Darwin and Rosetta 2:
+
+1. **Page Alignment:** `mach_vm_protect` requires page-aligned start addresses and sizes. On Apple Silicon systems running Rosetta 2, page sizes can be 4 KB (x86_64 ABI) or 16 KB (ARM64 host). Using `getpagesize()` dynamically ensures proper boundary calculations:
+   ```cpp
+   mach_vm_size_t pageSize = static_cast<mach_vm_size_t>(getpagesize());
+   mach_vm_address_t pageStart = address & ~(pageSize - 1);
+   mach_vm_size_t pageLen = ((address + length + pageSize - 1) & ~(pageSize - 1)) - pageStart;
+   ```
+
+2. **Copy-on-Write (`VM_PROT_COPY`):** Executable code pages mapped from disk are read-only and shared. Calling `mach_vm_protect` with `VM_PROT_WRITE` alone fails with `KERN_PROTECTION_FAILURE`. Adding `VM_PROT_COPY` forces Darwin to allocate a private writable shadow page for the target task:
+   ```cpp
+   kern_return_t kp = mach_vm_protect(task_, pageStart, pageLen, FALSE,
+                                      original | VM_PROT_WRITE | VM_PROT_COPY);
+   ```
+
+3. **Restoration:** Once `mach_vm_write` transfers the patch bytes, `mach_vm_protect` is immediately called again to restore the original page protection (`VM_PROT_READ | VM_PROT_EXECUTE`), leaving memory protections in a clean state.
+
+---
+
+## 21. State Buildings Engine & Per-State Container Lookup
+
+In the Clausewitz engine, building levels are stored inside a dedicated sub-container inside each state (`State + 0x110`). The internal layout mirrors the game's native accessors (`sub_100D280D0` and `sub_100D2CAC0`):
+
+```
+State + 0x110                       --> Building Container
+        + 0x20                      --> int32_t* indexTable (definitionId -> entryIndex)
+        + 0x2C                      --> int32_t  entryCount
+        + 0x38                      --> uint64_t* entryArray (array of pointers to BuildingEntry)
+              entry + 0x40          --> int16_t  level (raw integer value)
+```
+
+If `indexTable[defId] != -1`, the corresponding entry exists in `entryArray[indexTable[defId]]`, and `entry + 0x40` stores the level.
+
+### Confirmed Building Definition IDs
+
+| Definition ID | Script Identifier | In-Game Name | Default Max Level | Slot Type |
+|---|---|---|---|---|
+| `0` | `infrastructure` | Infrastructure | 5 (or 10 in older versions) | State-wide |
+| `1` | `arms_factory` | Military Factories | 20 | Shared Building Slot |
+| `2` | `industrial_complex` | Civilian Factories | 20 | Shared Building Slot |
+| `3` | `air_base` | Air Bases | 10 | State-wide |
+| `4` | `supply_node` | Supply Nodes | 1 | Province-level |
+| `5` | `rail_way` | Railways | 5 | Province-level |
+| `7` | `naval_base` | Naval Bases | 10 | Coastal Province |
+| `8` | `bunker` | Land Forts (Bunkers) | 10 | Province-level |
+| `9` | `coastal_bunker` | Coastal Forts | 10 | Coastal Province |
+| `11` | `dockyard` | Naval Dockyards | 20 | Shared Building Slot (Coastal) |
+| `12` | `anti_air_building` | Anti-Air Buildings | 5 | State-wide |
+| `13` | `synthetic_refinery` | Synthetic Refineries | 3 | Shared Building Slot |
+| `14` | `fuel_silo` | Fuel Silos | 5 | Shared Building Slot |
+| `15` | `radar_station` | Radar Stations | 6 | State-wide |
+| `20` | `nuclear_reactor` | Nuclear Reactors | 1 | Shared Building Slot |
+
+> [!NOTE]
+> **Building Slots Constraint:** Civilian factories, military factories, and dockyards share the state's unlocked building slots (`shares_slots = yes`). While writing memory sets the underlying building level, only factories up to the state's currently unlocked slot count are active in game production.
+
+---
+
+## 22. Division Architecture, Native Country Array, and Perpetual Organization Lock
+
+### Binary Architecture (`CArmy : public CUnit`)
+
+Every land division in Hearts of Iron IV on macOS x86_64 is an allocated C++ instance of `CArmy` (subclassing `CUnit`), allocated with size `0x678` bytes:
+
+- **Virtual Table:** The primary virtual table `__ZTV5CArmy` is at `imageBase + 0x3297548` (`0x103297548`).
+- **Secondary Virtual Table:** Located at `CArmy + 0x10` is `imageBase + 0x32977d0`.
+- **Identity:** Every active division has its first 8 bytes strictly equal to `imageBase + 0x3297548`.
+
+### Automatic Division Enumeration via Native Country Vector (`Country + 0x250`)
+
+Previously, locating divisions required the player to select a unit on the map or scan gigabytes of process heap memory. Disassembly of `country.cpp` (`sub_10117b9bb` and `sub_10117e830`) revealed that `CCountry` maintains an internal Clausewitz dynamic array:
+
+```
+Country + 0x250    --> uint64_t* data (pointer array of CArmy* pointers)
+Country + 0x258    --> int32_t   capacity
+Country + 0x25C    --> int32_t   count (total land divisions owned by country)
+```
+
+- **Instantaneous (0ms):** The trainer reads this vector directly to discover **100% of the player's divisions automatically** on startup without requiring any clicks, selections, or console commands.
+- **Other military vectors in CCountry:**
+  - `Country + 0x238`: Array of `CArmyGroup*` (count at `+0x244`)
+  - `Country + 0x268`: Array of `CFleet*` navies/fleets (count at `+0x274`)
+
+### Confirmed Memory Layout of a Division (`CArmy`)
+
+All combat statistics, health, and organisation in HOI4 are **signed 64-bit integers (`int64_t`)** scaled by `100,000` (`CFixedPoint`):
+
+| Offset | Type | Scale | Description |
+|---|---|---|---|
+| `+0x00` | `uint64_t` | Pointer | Virtual Table Pointer (`imageBase + 0x3297548`) |
+| `+0x08` | `int32_t` | — | Unit Type Tag (`0` = land division) |
+| `+0x10` | `uint64_t` | Pointer | Secondary Virtual Table Pointer (`imageBase + 0x32977d0`) |
+| `+0x138` | `uint64_t` | Pointer | Stats Object (`CDivisionStats*`) |
+| `*(stats + 0x268)` | `int64_t` | `/ 100,000` | **Maximum Organisation** |
+| `*(stats + 0x270)` | `int64_t` | `/ 100,000` | **Maximum Hit Points (Strength)** |
+| `+0x188` | `int64_t` | `/ 100,000` | Hard Attack |
+| `+0x190` | `int64_t` | `/ 100,000` | Soft Attack |
+| `+0x198` | `int64_t` | `/ 100,000` | Hard Attack Multiplier / Factor |
+| `+0x1A0` | `int64_t` | `/ 100,000` | Soft Attack Multiplier / Factor |
+| `+0x1A8` | `int64_t` | `/ 100,000` | Defense |
+| `+0x1B0` | `int64_t` | `/ 100,000` | Breakthrough |
+| `+0x1B8` | `int64_t` | `/ 100,000` | Armor / Hardness |
+| `+0x1D8` | `int32_t` | — | Owner Country Tag |
+| `+0x1E0` | `int32_t` | — | Controller Country Tag |
+| `+0x418` | `int64_t` | `/ 100,000` | **Current Hit Points (HP / Strength)** |
+| `+0x420` | `int64_t` | `/ 100,000` | **Current Organisation** |
+| `+0x428` | `int64_t` | `/ 100,000` | **Experience / Veterancy** (`0` to `100,000` = 100% Veteran) |
+
+### Perpetual Full Organization Lock ("Never Drops")
+
+In HOI4, the internal engine setter `CArmy::SetOrganisation` (`0x100072bc0`) clamps `organisation` at `+0x420` to `*(stats + 0x268)` (`maxOrganisation`).
+
+When the background **Division Freeze** loop runs:
+1. It loops at an interval of **50 milliseconds (20 passes per second)**.
+2. For each division, it sets both `*(stats + 0x268)` and `division + 0x420` to maximum.
+3. Because the clamp condition is satisfied and the background thread rewrites the value 20 times every second, **division organisation never decreases**, even when fighting against overwhelming odds or moving through harsh attrition terrain.
+
+---
+
+## 23. Military Leaders & Commander System (`CLeader`)
+
+Military commanders (Generals, Field Marshals, and Admirals) are managed through the Character / Leader Manager at `Country + 0xD98`:
+
+```
+Country + 0xD98                        --> Character / Leader Manager
+        + 0x70                         --> BVector<CLeader*> Generals (Corps Commanders)
+        + 0x88                         --> BVector<CLeader*> Field Marshals
+        + 0xA0                         --> BVector<CLeader*> Navy Admirals
+```
+
+Inside each `CLeader` object:
+- `Leader + 0xC98`: Pointer to stats & trait descriptor object (`Stats*`).
+- `*(Leader + 0xC98) + 0x180`: **True Skill Level (1 to 9)** (`int32_t`).
+- `Leader + 0xCA0`: Experience (`int64_t`, scaled by `100,000`).
+- `Leader + 0xCB4`: **Leader Role / Assignment Type** (`int32_t`):
+  - `0` = General (Corps Commander)
+  - `1` = Field Marshal
+  - `2` = Navy Admiral
+- `Leader + 0xCB8`: Attack Skill (`int32_t`)
+- `Leader + 0xCBC`: Defense Skill (`int32_t`)
+- `Leader + 0xCC0`: Planning Skill (`int32_t`)
+- `Leader + 0xCC4`: Logistics Skill (`int32_t`)
+
+### The 0xCB4 Bug & Repair Solution
+
+The game engine performs checks such as `cmpl $0, 0xCB4(%rax)` and `cmpl $1, 0xCB4(%rax)` in hundreds of places for medal assignments, field marshal promotion eligibility, and army group commands. Older trainer versions mistakenly treated `0xCB4` as the skill level and wrote `9` to it, corrupting the leader's role and breaking medals and promotions.
+
+The trainer now:
+1. Writes the real skill level to `*(Leader + 0xC98) + 0x180`.
+2. Provides option `4) REPAIR ALL LEADERS` to automatically restore `0xCB4` to `0` for Generals, `1` for Field Marshals, and `2` for Admirals.
+
+---
+
+## 24. Static Engine Toggles & 1-Day National Focus
+
+Several engine features are governed by single-byte static flags in the engine's global data segment (`0x1034EDF48` table):
+
+| Offset | Flag Name | In-Game Command | Effect |
+|---|---|---|---|
+| `imageBase + 0x34EDFD0` | `instantconstruction` | `ic` | Buildings complete instantly (affects all countries) |
+| `imageBase + 0x34EDFD1` | `instantshiprefit` | `instantshiprefit` | Upgrades and refits apply immediately |
+| `imageBase + 0x34EDFD3` | `instanttraining` | `it` | Unit training finishes instantly |
+| `imageBase + 0x34EDFC0` | `allowtraits` | `allowtraits` | Removes trait requirements; leaders can learn all traits |
+| `imageBase + 0x34EDFD4` | `freefocuses` (A) | `ff` / `freefocuses` | Bypasses national focus prerequisites |
+| `imageBase + 0x34EDFD8` | `freefocuses` (B) | `ff` | Active national focus completes in **1 day** on daily tick |
+| `imageBase + 0x34EDFD9` | `freefocuses` (C) | `ff` | Allows freely activating any national focus |
+| `imageBase + 0x34EDFF0` | `allowideas` | `allowideas` | Allows freely picking national spirits and political ideas |
+| `imageBase + 0x34EDFF1` | `allowoperations` | `allowoperations` | Allows launching intelligence operations without constraints |
+
+---
+
+## 25. Intelligence Agency & Operations (`La Résistance` Godmode)
+
+All intelligence agency and clandestine operations mechanisms in Hearts of Iron IV are controlled by single-byte static flags residing within the engine's internal toggle table (`0x1034EDF48`):
+
+| Offset | Flag Name | In-Game Command / Function | Effect |
+|---|---|---|---|
+| `imageBase + 0x34EDFD2` | `Operation.Instant` | `instantoperation` | All intelligence operations (infiltrations, coups, tech steals) complete instantly in 0 days |
+| `imageBase + 0x34EDFCB` | `IntelNetwork.Instant` | `instantintelnetwork` | Maxes spy network strength to **100% instantly** upon placing an operative in a state |
+| `imageBase + 0x34EDFCC` | `Agency.InstantSlotUnlock`| `instantslotunlock` | Unlocks all operative slots immediately |
+| `imageBase + 0x34EDFD5` | `Agency.Autocomplete` | `agency.autocomplete` | Agency department upgrades build in **0 days** without requiring civilian factories |
+| `imageBase + 0x34EDFD7` | `Department.Instant` | Department completion flag | Bypasses department construction wait queues |
+| `imageBase + 0x34EDFF1` | `allowoperations` | `allowoperations` | Allows launching any operation regardless of network size, equipment, or tokens |
+| `imageBase + 0x34EDFF5` | `prevent_operative_detection` | `preventoperativedetection` | Operatives are **100% immune** to detection, capture, injury, or assassination by enemy counterintelligence |
+
+### Instant Agency Creation & Upgrades
+- In vanilla HOI4, creating an agency takes 30 days and requires 5 civilian factories (`NOperatives::AGENCY_CREATION_DAYS` and `AGENCY_CREATION_FACTORIES`).
+- When `Agency.Autocomplete` (`0x34EDFD5`) and `Department.Instant` (`0x34EDFD7`) are enabled:
+  1. Creating an Intelligence Agency completes in **0 days** on the next daily tick (or instantly upon pressing the create button).
+  2. Upgrading any department branch (Cryptology, Defense, Psychological Warfare, Branch Offices) takes **0 days** and consumes 0 civilian factories.
+  3. Operations finish on the exact day they are launched (`Operation.Instant`).
+  4. Network strength jumps straight to 100% (`IntelNetwork.Instant`).
+
+In the trainer, key `a)` provides individual toggles as well as a **Master Switch** (`1) TOGGLE ALL AGENCY GODMODE`) that activates all 7 perks simultaneously.
+
+---
+
+## 26. Doctrines & Subdoctrines Instant Unlock System & Subdoctrine Mastery
+
+Hearts of Iron IV handles doctrine advancement through a combination of military branch experience pools (Army, Navy, and Air XP), tech tree nodes, and the modern **Subdoctrine Mastery System** (introduced in 1.13+ / AAT / Götterdämmerung):
+
+### 1. Instant Unlock on Click (`roic` / `research_on_icon_click`)
+- Offset: `imageBase + 0x34EDFBE` (one byte, `0` or `1`).
+- When set to `1`, clicking **any doctrine or subdoctrine icon** in the Officer Corp / Research tree (e.g. Grand Battleplan, Mobile Warfare, Superior Firepower, Mass Assault, Fleet in Being, Base Strike, Battlefield Support) **instantly researches and unlocks it in 0 seconds**, bypassing prerequisites and mutual exclusivity blocks.
+
+### 2. Fast Research (`research_fast`)
+- Offset: `imageBase + 0x34EDFC1` (one byte, `0` or `1`).
+- Sets the base research point cost to 1 RP.
+
+### 3. Military Branch Experience Refill
+- Stored at `*(Country + 0x12E8)`:
+  - `+0x10`: Air XP (scale 32,768)
+  - `+0x28`: Navy XP (scale 32,768)
+  - `+0x40`: Army XP (scale 32,768)
+- Setting all three to `500` provides the maximum possible XP cap for manual doctrine tree progression.
+- In the trainer, key `m)` provides a 1-click **Doctrine Godmode** that refills all XP to 500 and enables `roic`, allowing the player to max out any subdoctrine tree in seconds.
+
+### 4. Subdoctrine Mastery Architecture & Instant Maxing
+Modern HOI4 features subdoctrine mastery bars (e.g. tracks within Grand Battleplan, Mobile Warfare, etc.) that level up milestones and grant passive combat tactic modifiers.
+
+#### Memory Layout (`GameState + 0x3C0` -> `CDoctrineManager`):
+- `GameState + 0x3C0`: Pointer to `CDoctrineManager` container.
+- `*(docMgr + 0x8)`: Array of Country Doctrine records (`0xA0` bytes per country record).
+- `*(docMgr + 0x14)`: Count of country doctrine records (`uint32_t`).
+- Within each Country Doctrine record (`countryDocRec`):
+  - `countryDocRec + 0x10`: Array of active doctrine tracks (`0x50` bytes per track).
+  - `countryDocRec + 0x1C`: Number of active doctrine tracks (`int32_t`).
+  - `track + 0x18`: Pointer to subdoctrine tracks array (`0x60` bytes per subdoctrine).
+  - `track + 0x24`: Number of subdoctrine tracks (`int32_t`).
+  - Within each Subdoctrine Track (`0x60` bytes):
+    - `+0x08`: Pointer to subdoctrine descriptor/template.
+    - `+0x10`: **Milestones Level / Tier** (`int32_t`, 0 to 5).
+    - `+0x18`: **Accumulated Mastery Points** (`int64_t`).
+    - `+0x20`: **Banked Mastery Points** (`int64_t`).
+
+#### In-Trainer Instant Mastery Maxing:
+- Under menu `m)`, option `5) MAX SUBDOCTRINE MASTERY` reads the active tracks from memory and directly writes `50,000` mastery points and milestone tier `5` into all active subdoctrine records.
+
+#### Paradox Native Console Command:
+Disassembly of `0x100f85550` and `0x100f84910` confirmed the exact official developer cheat built into the game:
+```
+command:     mastery <amount> [optional track name]
+description: "Give doctrine mastery, globally or to a specific track"
+source:      source/doctrines/doctrine_system.cpp
+```
+- Typing `mastery 5000` in the developer console (`~`) instantly awards 5,000 mastery points to all active doctrine tracks of the player country and unlocks all subdoctrine milestones and combat tactics!
+
+---
+
+## 27. Military Leaders Sub-Skills & Role Preservation Architecture
+
+### Commander Sub-Skills Layout (`CLeader`)
+Every commander (`CLeader`) stores their sub-skills in 4 consecutive 32-bit integers (`int32_t`):
+
+```
+Leader + 0xCB8    int32_t  Attack Skill (0 - 10+)
+Leader + 0xCBC    int32_t  Defense Skill (0 - 10+)
+Leader + 0xCC0    int32_t  Planning Skill / Maneuvering (0 - 10+)
+Leader + 0xCC4    int32_t  Logistics Skill / Coordination (0 - 10+)
+```
+*(For Navy Admirals, these four fields represent Attack, Defense, Maneuvering, and Coordination respectively).*
+
+### Role Integrity & Bug Prevention (`Leader + 0xCB4`)
+- `Leader + 0xCB4`:
+  - `0` = Corps Commander (General)
+  - `1` = Army Group Commander (Field Marshal)
+  - `2` = Fleet Admiral
+- **The Bug in Previous Trainers:** The leader manager vectors at `Country + 0xD98` (`+0x70`, `+0x88`, `+0xA0`) are internal hash map buckets, NOT pure role-segregated arrays. Older repair routines unconditionally wrote `0` to leaders found in `0x70`, `1` to `0x88`, and `2` to `0xA0`, forcibly converting Generals to Field Marshals and Admirals to Army Generals.
+- **The Solution:**
+  1. The trainer strictly reads native `0xCB4` to determine the leader's actual role.
+  2. Experience additions, Skill Level modifications, and Sub-skill modifications **never touch `0xCB4`**.
+  3. Generals, Field Marshals, and Admirals retain their exact roles and army assignments.
+  4. The Repair option only intervenes if `0xCB4 < 0 || 0xCB4 > 2` (values like `9` caused by old corrupted saves).
+  5. The player can also manually change a specific leader's role (General $\leftrightarrow$ Field Marshal $\leftrightarrow$ Admiral) via option `1 -> 5`.
+
+---
+
+## 28. Division Godmode Invulnerability & Veterancy Scaling
+
+### Crash Resolution on Division Freeze & Godmode (Options 1 & 3)
+- **Root Cause:** In earlier versions, `setCombatStats()` attempted to write values to `CArmy + 0x188`, `+0x190`, `+0x1A8`, and `+0x1B0`. Live binary disassembly demonstrated that in `CArmy`, `0x188` and `0x1A8` are internal pointer headers and struct boundaries. Overwriting them corrupted the heap, causing immediate `EXC_BAD_ACCESS` crashes when the game rendered or selected units.
+- **The Fix:** True division invulnerability in Hearts of Iron IV does not require modifying derived combat stats. The game engine dynamically calculates soft/hard attack and defense every tick from template battalions and stockpile equipment. Godmode is achieved with 100% stability by perpetually locking:
+  1. **Organisation to 100%:** `division + 0x420` and `*(stats + 0x268)` locked at maximum (units never lose battles, never retreat, and never get pushed back).
+  2. **Hit Points to 100%:** `division + 0x418` and `*(stats + 0x270)` locked at maximum (units take 0 damage, 0 casualties, and lose 0 equipment).
+
+### Veterancy Scaling Bug & Fix (Option 11)
+- **Root Cause:** Disassembly of `sub_100073d60` revealed that `division + 0x428` does **not** store a 0.0 - 1.0 fraction or a 100,000 scale integer:
+  ```asm
+  100073d66: movq 0x428(%rbx), %rdx       ; raw experience from division
+  100073d80: movl %ecx, %eax              ; division total manpower
+  100073d82: imulq $0x186a0, %rax, %rcx   ; manpower * 100,000
+  100073d89: imulq $0x186a0, %rdx, %rax   ; raw_experience * 100,000
+  100073d9e: idivq %rcx                   ; (raw_experience * 100,000) / (manpower * 100,000)
+  ```
+  The field stores cumulative raw experience equal to `manpower * veterancy_ratio * 100,000`. When older versions wrote `100,000` (assuming 100%), dividing by 10,000 manpower yielded `10 / 100,000 = 0.01%`, which the game classified as rank 0: **GREEN**.
+- **The Fix:** The trainer now scales experience to the full cumulative range:
+  - **Veteran (Rank 5, 100% XP):** `2,000,000,000LL`
+  - **Seasoned (Rank 4, 75% XP):** `1,200,000,000LL`
+  - **Regular (Rank 3, 30% XP):** `500,000,000LL`
+  - **Trained (Rank 2, 10% XP):** `150,000,000LL`
+  - **Green (Rank 1, 0% XP):** `0LL`
+  Setting Option 11 now reliably promotes all player divisions to full **Veteran** rank (+75% combat bonus).
+
+---
+
+## 29. Automated Offset Scanner & Header Auto-Updater (`offset_scanner`)
+
+When Paradox releases an update for Hearts of Iron IV on Steam / macOS, binary structure offsets, cheat table addresses, and function entry points shift. 
+
+[`offset_scanner.cpp`](file:///Users/opriscodrut/Downloads/HOI4-macOS-offsets-main/offset_scanner.cpp) was built to automatically re-derive and verify **all 124 offsets, pointers, gates, and function addresses** without manual disassembler work, and automatically update [`hoi4_offsets.hpp`](file:///Users/opriscodrut/Downloads/HOI4-macOS-offsets-main/hoi4_offsets.hpp).
+
+### Techniques Used
+1. **Array-of-Bytes (AOB) Signatures:** Scans for resilient byte patterns with wildcards (`?`, `??`) invariant across compiler re-layouts.
+2. **String Cross-References (XREFs):** Finds exact engine string tokens (`"NAVAL_INVASION_PREPARE_DAYS"`, `"PARADROP_HOURS"`, etc.) and resolves the RIP-relative `lea` instructions registering each define.
+3. **Itanium C++ RTTI Reconstruction:** Traverses `__TEXT` and `__DATA` to locate type descriptors (`"5CArmy\0"`, `"8CCountry\0"`), resolves their `type_info` structs, and dynamically discovers runtime vtables (`__ZTV5CArmy`).
+4. **Dynamic Instruction Decoding:** Extracts direct field displacements from constructor machine code (`movups %xmm0, disp(%rbx)` for army groups, divisions, fleets, hitpoints, org, and planning).
+5. **Live Process & Offline Binary Modes:** Can scan either the Mach-O binary file on disk or the virtual memory of a running `hoi4` process using `mach_vm_read_overwrite`.
+
+### Build
+```bash
+clang++ -std=c++17 -O2 offset_scanner.cpp -o offset_scanner
+```
+
+### Usage
+```bash
+# 1. Audit & verify offsets against local HOI4 installation (auto-detects Steam path)
+./offset_scanner
+
+# 2. Automatically update hoi4_offsets.hpp after a game update (creates .bak backup)
+./offset_scanner --update
+
+# 3. Specify custom binary path
+./offset_scanner "/path/to/hoi4.app/Contents/MacOS/hoi4" --update
+
+# 4. Save to a separate header file without overwriting
+./offset_scanner -o updated_offsets.hpp
+
+# 5. Scan a live running process
+./offset_scanner --live
+
+# 6. Output pure JSON for tooling/scripts
+./offset_scanner --json
+```
+
+### Coverage (124 Items, 100% Success Rate)
+- **Globals & GameState:** `gameStatePointer`, `tagIndexTable`, `countryArray`, `playerTagPrimary`, `playerTagFallback`, `doctrineManagerOffset`, `globalStateArray`, `selectionRoot`, `lastSelectedUnit`, `consoleCmdManagerPointer`, `consoleObjectPointer`.
+- **All 18 Cheat Table Toggles:** `researchOnIconClick`, `allowTraits`, `researchFast`, `instantIntelNetwork`, `instantAgencySlotUnlock`, `instantConstruction`, `instantShipRefit`, `instantOperation`, `instantTraining`, `focusAutocomplete`, `instantAgencyUpgrade`, `instantAgencyDepartment`, `allowIdeas`, `allowOperations`, `preventOperativeDetection`, `instantSpecialProjects`.
+- **NDefines:** `navalInvasionPrepareDays`, `navalInvasionPlanCap`, `baseNavalInvasionDivCap`, `airInvasionPrepareDays`, `paradropHours`, `paradropAirSuperiorityRatio`.
+- **Engine Functions:** `manpowerCommandHandler`, `manpowerSetter`, `manpowerDistributor`, `stateManpowerAdd`, `stateManpowerTake`, `countryFromTag`, `getCountry`, `resourceProducedGetter`, `resourceDatabaseLoader`.
+- **Console & Multiplayer Gates:** `consoleIsAvailableFunc`, `consoleShowConsoleFunc`, `consoleToggleKeyGate`, `consoleGateCheckA`, `consoleIronmanMultiplayerGate`, `consoleExecCheckRelease`, `consoleExecCheckMultiplayer`, `consoleExecCheckIronman`, `consoleExecCheckDevOnly`, `multiplayerKickGuiGate`, `chatKickOperatorCheck`, `chatKickLoopCheck`.
+- **Vtables:** `divisionVtable` (`__ZTV5CArmy` primary), `divisionVtable2`.
+- **Divisions (`CArmy`):** `divisionHitPoints`, `divisionOrganisation`, `divisionExperience`, `divisionEntrenchmentCap`, `divisionPlanningBase`, `divisionPlanningBonus`, `divisionSoftAttack`, `divisionHardAttack`, `divisionDefense`, `divisionBreakthrough`, `divisionArmor`, `divisionOwnerTag`.
+- **Country Structures:** `countryTagString`, `countryNameString`, `countryArmyGroupsArray`, `countryDivisionsArray`, `countryFleetsArray`, `commandPower`, `commandPowerCap`, `politicalPower`, `specialProjectsObject`, `nukeObjectPointer`, `experienceObject`, `modifierObject`.
+- **Leaders & States:** `leaderGeneralsVector`, `leaderFieldMarshalsVector`, `leaderAdmiralsVector`, `leaderStatsObject`, `leaderExperience`, `leaderRole`, sub-skills (`Attack`, `Defense`, `Planning`, `Logistics`), `stateResourceValue`, `stateBuildingContainer`, `buildingLevel`, `stateManpower`.
+
+
+
+
