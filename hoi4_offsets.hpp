@@ -137,7 +137,19 @@ struct Offsets {
     // Derived from: mov 0x2d8(%r12), %rcx ; mov (%rcx,%rax,8), %rax
     int64_t countryArray = 0x2D8;
 
+    // Doctrine Manager / Country Doctrine storage
+    // GameState + 0x3C0 -> CDoctrineManager pointer (container of country doctrine trees & mastery)
+    int64_t doctrineManagerOffset = 0x3C0;
+
     // --- Country ---
+
+    // Country tag string (3 letters e.g. "ROM", "GER", "ENG", "SOV")
+    // libc++ std::string at Country + 0x10, returned by sub_1011772d0
+    int64_t countryTagString = 0x10;
+
+    // Country name / localized token string (e.g. "Romania", "Germany")
+    // libc++ std::string at Country + 0x40, returned by sub_1011772e0
+    int64_t countryNameString = 0x40;
 
     // Country-level CManpower sub-object, passed as `this` to manpowerSetter.
     int64_t countryManpowerObject = 0x2E8;
@@ -147,6 +159,10 @@ struct Offsets {
     //               mov 0xc(%r15), %r13d      where r15 = Country + 0x420
     int64_t stateArray = 0x420;
     int64_t stateCount = 0x42C;
+
+    // Controlled / occupied state array (Country + 0x438)
+    int64_t controlledStateArray = 0x438;
+    int64_t controlledStateCount = 0x444;
 
     // Diplomacy object, used by the exile check.
     int64_t diplomacyObject = 0xD30;
@@ -218,6 +234,10 @@ struct Offsets {
     int64_t buildingCount          = 0x2C;    // container + this -> int32 (56)
     int64_t buildingEntryArray     = 0x38;    // container + this -> entry*[]
     int64_t buildingLevel          = 0x40;    // entry + this -> int16, writable
+    int64_t buildingHealthyLevel   = 0x42;    // entry + this -> int16, operational/healthy level (matches level for 100% health)
+    int64_t buildingDamage         = 0x48;    // entry + this -> int64, damage counter (0 = full repair)
+    int64_t buildingHealthRatio    = 0x50;    // entry + this -> int64, health factor (100000 = 100% full health)
+    int64_t buildingActive         = 0x8C;    // entry + this -> uint8, active flag (1 = active)
 
     // --- GameState global state array ---
 
@@ -726,14 +746,41 @@ struct Offsets {
     // `instantshiprefit` (sub_1001424F0). With it set, sub_100A65000 skips
     // the refit process entirely and applies the upgrade to each selected
     // ship straight away.
-    int64_t instantShipRefit       = 0x34EDFD1;   // imageBase + this, one byte
+    int64_t instantConstruction    = 0x34EDFD0;   // imageBase + this, one byte (0x1034edf48 + 0x88)
+    int64_t instantShipRefit       = 0x34EDFD1;   // imageBase + this, one byte (0x1034edf48 + 0x89)
+    int64_t instantTraining        = 0x34EDFD3;   // imageBase + this, one byte (0x1034edf48 + 0x8b)
 
-    // `instantconstruction` (sub_100142420). Despite the name this only
-    // covers buildings: both places that read it sit in
-    // CProductionStatus::AddConstruction, and the instant branch there is
-    // gated on `!bRepair && !bConversion`, so ship repair and conversion
-    // never take it.
-    int64_t instantConstruction    = 0x34EDFD0;   // imageBase + this, one byte
+    // `allowtraits` console command (sub_10013f890): "Allows to learn all traits."
+    // Reverses restriction on assigning traits to military leaders.
+    int64_t allowTraits            = 0x34EDFC0;   // imageBase + this, one byte (0x1034edf48 + 0x78)
+
+    // `freefocuses` / `ff` console command (sub_1001863d0): "Enable freely activating any focuses"
+    // Sets three static flags that bypass prerequisites, allow any focus to start,
+    // and complete active focus in 1 day on the daily tick.
+    int64_t focusAutocomplete      = 0x34EDFD4;   // imageBase + this, byte (0x1034edf48 + 0x8c)
+    int64_t focusAutocompleteB     = 0x34EDFD8;   // imageBase + this, byte (0x1034edf48 + 0x90)
+    int64_t focusAutocompleteC     = 0x34EDFD9;   // imageBase + this, byte (0x1034edf48 + 0x91)
+
+    // Additional confirmed toggles in the same table:
+    int64_t allowIdeas             = 0x34EDFF0;   // imageBase + this, byte (0x1034edf48 + 0xa8, allowideas)
+    int64_t allowOperations        = 0x34EDFF1;   // imageBase + this, byte (0x1034edf48 + 0xa9, allowoperations)
+    int64_t researchFast           = 0x34EDFC1;   // imageBase + this, byte (0x1034edf48 + 0x79, research_fast - tech cost 1 RP)
+
+    // Intelligence Agency & Operations (La Résistance toggles in 0x1034edf48 table):
+    int64_t instantOperation          = 0x34EDFD2;   // imageBase + this, byte (0x1034edf48 + 0x8a, Operation.Instant)
+    int64_t instantIntelNetwork       = 0x34EDFCB;   // imageBase + this, byte (0x1034edf48 + 0x83, IntelNetwork.Instant)
+    int64_t instantAgencySlotUnlock   = 0x34EDFCC;   // imageBase + this, byte (0x1034edf48 + 0x84, Agency.InstantSlotUnlock)
+    int64_t instantAgencyUpgrade      = 0x34EDFD5;   // imageBase + this, byte (0x1034edf48 + 0x8d, Agency.Autocomplete - upgrades build in 0 days)
+    int64_t instantAgencyDepartment   = 0x34EDFD7;   // imageBase + this, byte (0x1034edf48 + 0x8f, Department instant)
+    int64_t preventOperativeDetection = 0x34EDFF5;   // imageBase + this, byte (0x1034edf48 + 0xad, prevent_operative_detection - operatives never detected/killed)
+
+    // Naval Invasions & Paradrop (NDefines in DATA segment):
+    int64_t navalInvasionPrepareDays     = 0x34FE718; // NNavy::NAVAL_INVASION_PREPARE_DAYS (int32_t, vanilla=3)
+    int64_t navalInvasionPlanCap         = 0x34FE728; // NNavy::NAVAL_INVASION_PLAN_CAP (int32_t)
+    int64_t baseNavalInvasionDivCap      = 0x34FE738; // NNavy::BASE_NAVAL_INVASION_DIVISION_CAP (int32_t, vanilla=10)
+    int64_t airInvasionPrepareDays       = 0x34FE088; // NAir::AIR_INVASION_PREPARE_DAYS (int32_t, vanilla=7)
+    int64_t paradropHours                = 0x34FCBC8; // NMilitary::PARADROP_HOURS (int32_t, vanilla=48)
+    int64_t paradropAirSuperiorityRatio  = 0x34F3888; // NCountry::PARADROP_AIR_SUPERIORITY_RATIO (int64_t, vanilla=70000)
 
     // --- Divisions ---
     //
@@ -797,47 +844,92 @@ struct Offsets {
     // pointer somewhere else. Strength therefore cannot be set from here -
     // filling the country stockpile and letting the divisions reinforce is the
     // way to move it today.
-    int64_t divisionStride           = 0x1000;   // pool stride, confirmed
-    int64_t divisionTypeTag          = 0x08;     // int32, 0/1/13 per the handler
-    int64_t divisionSlotUsed         = 0x0C;     // int32, 1 = live, 0 = free slot
-    int64_t divisionHitPoints        = 0x418;    // int32, /100000  (HP 226.3333)
-    int64_t divisionOrganisation     = 0x420;    // int32, /100000  current org
-    int64_t divisionDefense          = 0x890;    // int32, /100000  (93.1741)
-    int64_t divisionBreakthrough     = 0x898;    // int32, /100000  (15.3069)
-    int64_t divisionSoftAttack       = 0x8A8;    // int32, /100000  (35.6977)
-    int64_t divisionMaxOrganisation  = 0xA68;    // int32, /100000  max org
-    int64_t divisionHitPointsCopy    = 0xA70;    // int32, /100000  second copy
+    // --- Divisions (CArmy : public CUnit) ---
+    //
+    // Binary architecture confirmed by Mach-O disassembly:
+    // Every land division in memory is an instance of CArmy (size 0x678 bytes).
+    // The virtual table pointer at +0x00 is imageBase + 0x3297548 (__ZTV5CArmy).
+    //
+    // How the player's divisions are found:
+    // CCountry maintains a direct dynamic array CPdxArray<CArmy*, int> at
+    // Country + 0x250 (pointer array) with count at Country + 0x25C.
+    // This allows instantaneous, 100% complete discovery of ALL divisions owned
+    // by the player without requiring unit selection or console commands.
+    uint64_t divisionVtable          = 0x3297548; // imageBase + this -> __ZTV5CArmy primary vtable
+    uint64_t divisionVtable2         = 0x32977d0; // imageBase + this -> secondary vtable at +0x10
+    int64_t countryDivisionsArray    = 0x250;     // Country + this -> CArmy*[] (native division vector)
+    int64_t countryDivisionsCapacity = 0x258;     // Country + this -> int32 capacity
+    int64_t countryDivisionsCount    = 0x25C;     // Country + this -> int32 count
+    int64_t countryArmyGroupsArray   = 0x238;     // Country + this -> CArmyGroup*[]
+    int64_t countryArmyGroupsCount   = 0x244;     // Country + this -> int32 count
+    int64_t countryFleetsArray       = 0x268;     // Country + this -> CFleet*[]
+    int64_t countryFleetsCount       = 0x274;     // Country + this -> int32 count
+
+    int64_t divisionTypeTag          = 0x08;      // int32, 0 for land army unit
+    int64_t divisionSlotUsed         = 0x0C;      // int32, legacy pool slot flag
+    int64_t divisionStatsObject      = 0x138;     // CArmy + this -> CDivisionStats*
+    int64_t divisionStatsMaxOrg      = 0x268;     // Stats + this -> int64 (/100000, max organisation)
+    int64_t divisionStatsMaxHP       = 0x270;     // Stats + this -> int64 (/100000, max HP / strength)
+
+    // In CUnit (all combat stats are 64-bit int64_t scaled by 100,000):
+    int64_t divisionHardAttack       = 0x188;     // int64, /100000
+    int64_t divisionSoftAttack       = 0x190;     // int64, /100000
+    int64_t divisionHardAttackFactor = 0x198;     // int64, /100000
+    int64_t divisionSoftAttackFactor = 0x1A0;     // int64, /100000
+    int64_t divisionDefense          = 0x1A8;     // int64, /100000 (defense)
+    int64_t divisionBreakthrough     = 0x1B0;     // int64, /100000 (breakthrough)
+    int64_t divisionArmor            = 0x1B8;     // int64, /100000 (armor)
+    int64_t divisionOwnerTag         = 0x1D8;     // int32, country tag
+    int64_t divisionControllerTag    = 0x1E0;     // int32, country tag
+
+    // Dynamic runtime values (int64_t scaled by 100,000):
+    int64_t divisionHitPoints        = 0x418;     // int64, /100000 (current HP / strength)
+    int64_t divisionOrganisation     = 0x420;     // int64, /100000 (current organisation)
+    int64_t divisionExperience       = 0x428;     // int64, /100000 (veterancy 0 to 100,000)
+    int64_t divisionPlanningBonus    = 0x468;     // int64, /100000 (planning bonus, 100000 = 100%)
+    int64_t divisionPlanningBase     = 0x460;     // int64, /100000 (base planning cap)
+    int64_t divisionEntrenchment     = 0x450;     // int64, /100000 (current dig_in)
+    int64_t divisionEntrenchmentCap  = 0x458;     // int64, /100000 (max dig_in_cap)
+    int64_t divisionMaxOrganisation  = 0x268;     // in stats object (Stats + 0x268)
+    int64_t divisionHitPointsCopy    = 0x270;     // in stats object
+    int64_t divisionOwnerCountry     = 0x820;     // -> Country* pointer
     int64_t divisionFixedPointScale  = 100000;
 
-    // WHO OWNS A DIVISION
-    //
-    // The division carries a pointer straight back to its country object, and
-    // two tag fields beside each other. Found by searching a division for the
-    // player country address that the SDK already resolves from GameState, and
-    // confirmed by reading the same offset on both neighbouring divisions in
-    // the pool - all three held the identical pointer.
-    //
-    // This is what makes the whole thing usable in Ironman and in any
-    // campaign. Rather than anchoring on a division the player has to select -
-    // which needs the console, and the console does not run in Ironman - the
-    // SDK scans for this pointer and keeps only the divisions whose owner
-    // matches playerCountry(). No console, no clicking, no assumption that the
-    // pool holds one country's divisions, and nothing that has to be redone
-    // when the campaign or the country changes.
-    //
-    // The two tags are almost certainly owner and controller - they differ on
-    // occupied territory and on lend-leased units - but the pointer is the
-    // better test, since comparing against a resolved country address leaves
-    // no room for a coincidence the way a small integer like 17 would.
-    int64_t divisionOwnerCountry     = 0x820;    // -> Country*, the owner
-    int64_t divisionOwnerTag         = 0x1D8;    // int32, country tag
-    int64_t divisionControllerTag    = 0x1E0;    // int32, country tag
+    int64_t divisionStride           = 0x1000;    // pool stride, legacy
+    int      divisionMaxGap          = 128;
+    int      divisionMaxCount        = 2048;
 
-    // The pool is sparse, so the walk has to tolerate empty slots before it
-    // decides it has reached the end. Eight was comfortably more than any gap
-    // seen in the 22-division range that was mapped.
-    int      divisionMaxGap   = 8;
-    int      divisionMaxCount = 512;
+    // --- Military Leaders / Commanders (Generals, Field Marshals, Admirals) ---
+    // Country + 0xD98 -> Character / Military Leader Manager
+    // Vector format: ptr at +0x00, capacity at +0x08, count at +0x0C
+    int64_t leaderManager            = 0xD98;    // Country + this -> Manager*
+    int64_t leaderGeneralsVector     = 0x70;     // Manager + this -> BVector<Leader*> (Corps Commanders)
+    int64_t leaderFieldMarshalsVector= 0x88;     // Manager + this -> BVector<Leader*> (Field Marshals)
+    int64_t leaderAdmiralsVector     = 0xA0;     // Manager + this -> BVector<Leader*> (Navy Admirals)
+    int64_t leaderExperience         = 0xCA0;    // Leader + this -> int64 (XP * 100000)
+    int64_t leaderStatsObject        = 0xC98;    // Leader + this -> Stats* (stats/traits descriptor object)
+    int64_t leaderStatsSkillLevel    = 0x180;    // Stats + this -> int32 (Skill level 1-9)
+
+    // Leader Role / Type at +0xCB4:
+    //   0 = Corps Commander (General)
+    //   1 = Field Marshal
+    //   2 = Navy Admiral
+    //
+    // CRITICAL: The game engine checks `cmpl $1, 0xCB4(%rax)` and `cmpl $0, 0xCB4(%rax)`
+    // in hundreds of places for medal eligibility, field marshal promotion, and assignment.
+    // Overwriting 0xCB4 with 9 (as a mistaken skill level) corrupts the leader's role,
+    // locking out medals, field marshal promotions, and army group assignments!
+    // Generals MUST have 0, Field Marshals MUST have 1, Admirals MUST have 2.
+    int64_t leaderRole               = 0xCB4;    // Leader + this -> int32 (0=General, 1=FieldMarshal, 2=Admiral)
+    int64_t leaderSkillLevelLegacy   = 0xCB4;    // Kept for compatibility, but DO NOT WRITE 9 HERE!
+
+    // Leader sub-skill offsets (Attack, Defense, Planning, Logistics, Skill 5)
+    // In HOI4 (0x1017f3c40 and 0x1017f6751), leader sub-skills are stored at stride 0x10 (16 bytes):
+    int64_t leaderAttackSkill        = 0xD88;    // Leader + this -> int32 (Attack)
+    int64_t leaderDefenseSkill       = 0xD98;    // Leader + this -> int32 (Defense)
+    int64_t leaderPlanningSkill      = 0xDA8;    // Leader + this -> int32 (Planning for Army / Maneuvering for Navy)
+    int64_t leaderLogisticsSkill     = 0xDB8;    // Leader + this -> int32 (Logistics for Army / Coordination for Navy)
+    int64_t leaderSkill5             = 0xDC8;    // Leader + this -> int32 (Skill 5 / Extra)
 
     // Written by unit_address with the pointer it just printed.
     int64_t lastSelectedUnit = 0x34EE050;   // imageBase + this -> unit pointer
@@ -852,6 +944,64 @@ struct Offsets {
     // Convenience helpers, relative to the state object itself.
     int64_t stateManpowerAbsolute()   const { return stateManpowerObject + stateManpower; }
     int64_t statePopulationAbsolute() const { return stateManpowerObject + statePopulation; }
+
+    // ---------------------------------------------------- ironman, multiplayer & console
+    // GameState + 0x0A8: uint32 flags (bit 0 = 1 if Ironman mode is active).
+    // Achievements require Ironman to be on. We NEVER clear this bit!
+    int64_t gameStateFlags              = 0x0A8;
+
+    // CConsoleCmdManager::IsConsoleAvailable() at imageBase + 0x2A520D0.
+    int64_t consoleIsAvailableFunc      = 0x2A520D0;
+
+    // CConsoleCmdManager::m_showConsole check function at imageBase + 0x2A52130.
+    // Original: 55 48 89 e5 0f b6 87 b0 00 00 00 5d c3
+    // Patch   : b8 01 00 00 00 c3 (mov $1, %eax; retq) -> always returns true
+    int64_t consoleShowConsoleFunc      = 0x2A52130;
+
+    // Keyboard event console toggle gate at imageBase + 0x0765E53:
+    // 0x0765E53: je 0x1007662f2 (0f 84 99 04 00 00 -> 90 90 90 90 90 90)
+    // NOPing this out forces the keyboard handler to ALWAYS toggle CConsole window.
+    int64_t consoleToggleKeyGate        = 0x0765E53;
+
+    // Keyboard event Ironman / Multiplayer gates:
+    // 0x07642A1: jne 0x100764454 (0f 85 ad 01 00 00 -> 90 90 90 90 90 90)
+    // 0x07642B1: je  0x100764454 (0f 84 9d 01 00 00 -> 90 90 90 90 90 90)
+    int64_t consoleGateCheckA           = 0x07642A1;
+    int64_t consoleIronmanMultiplayerGate = 0x07642B1;
+
+    // CConsoleCmdManager::Execute(char const*) checks:
+    // 0x2A522A5: je 0x102a522f6 (74 4f -> eb 4f) skips multiplayer/release checks
+    // 0x2A522BF: jne 0x102a522d8 (75 17 -> 90 90) disables multiplayer blocker jump
+    // 0x2A522D6: je 0x102a522f6 (74 1e -> eb 1e) skips ironman check
+    // 0x2A5244B: je 0x102a5245e (74 11 -> eb 11) unlocks developer-only commands
+    int64_t consoleExecCheckRelease     = 0x2A522A5;
+    int64_t consoleExecCheckMultiplayer = 0x2A522BF;
+    int64_t consoleExecCheckIronman     = 0x2A522D6;
+    int64_t consoleExecCheckDevOnly     = 0x2A5244B;
+
+    // Global CConsoleCmdManager instance pointer at imageBase + 0x35C80F0
+    int64_t consoleCmdManagerPointer    = 0x35C80F0;
+
+    // Global CConsole instance at imageBase + 0x35C0160
+    int64_t consoleObjectPointer        = 0x35C0160;
+    int64_t consoleGuiObject            = 0xB0;
+    int64_t consoleIsOpen               = 0xC4;
+
+    // Multiplayer Kick Unlocks
+    // 1. In-game Kick/Ban UI button gate (imageBase + 0x21B6E78)
+    //    Original: 74 18 (je 0x1021b6e92)
+    //    Patch   : eb 18 (jmp 0x1021b6e92) -> unlocks Kick/Ban buttons for all players in MP
+    int64_t multiplayerKickGuiGate      = 0x21B6E78;
+
+    // 2. Chat /kick command operator check (imageBase + 0x00D77F4)
+    //    Original: 7e 22 (jle 0x1000d7818 -> CHAT_ERROR_KICK_NOTOPERATOR)
+    //    Patch   : eb dd (jmp 0x1000d78d3) -> bypasses operator check, kicks targeted player
+    int64_t chatKickOperatorCheck       = 0x00D77F4;
+
+    // 3. Loop operator bypass (imageBase + 0x00D77DD)
+    //    Original: 0f 85 f0 00 00 00 (jne 0x1000d78d3)
+    //    Patch   : e9 f1 00 00 00 90 (jmp 0x1000d78d3; nop)
+    int64_t chatKickLoopCheck           = 0x00D77DD;
 };
 
 // ---------------------------------------------------------------- resources
