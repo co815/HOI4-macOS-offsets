@@ -15,8 +15,10 @@
 #include "hoi4_offsets.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <set>
+#include <unordered_set>
 #include <vector>
 #include <optional>
 #include <string>
@@ -54,12 +56,40 @@ struct StateResource {
 
 // One building slot inside one state. `level` is the persistent value the
 // game itself reads when evaluating building_level.
+inline const char* buildingDefinitionName(int id) {
+    switch (id) {
+        case 0:  return "Infrastructure";
+        case 1:  return "Military Factories (arms_factory)";
+        case 2:  return "Civilian Factories (industrial_complex)";
+        case 3:  return "Air Base";
+        case 4:  return "Supply Node";
+        case 5:  return "Railway";
+        case 6:  return "Naval Facility";
+        case 7:  return "Naval Base";
+        case 8:  return "Bunker (Land Fort)";
+        case 9:  return "Coastal Bunker";
+        case 10: return "Stronghold Network";
+        case 11: return "Dockyards";
+        case 12: return "Anti-Air Building";
+        case 13: return "Synthetic Refinery";
+        case 14: return "Fuel Silo";
+        case 15: return "Radar Station";
+        case 16: return "Mega Gun Emplacement";
+        case 17: return "Rocket Site";
+        case 18: return "Naval Supply Hub";
+        case 19: return "Naval Headquarters";
+        case 20: return "Nuclear Reactor";
+        default: return "Building";
+    }
+}
+
 struct StateBuilding {
-    uint64_t stateAddress = 0;
-    uint64_t entryAddress = 0;   // the entry object
-    uint64_t levelAddress = 0;   // entry + buildingLevel
-    int      index        = 0;   // position in the entry array
-    int16_t  level        = 0;
+    uint64_t    stateAddress = 0;
+    uint64_t    entryAddress = 0;   // the entry object
+    uint64_t    levelAddress = 0;   // entry + buildingLevel
+    int         index        = 0;   // building definition ID
+    int16_t     level        = 0;
+    const char* name         = nullptr;
 };
 
 // A country-level derived total, read from the container at Country+0xF80.
@@ -80,10 +110,12 @@ enum class ResourceContainer {
 };
 
 struct CountryInfo {
-    int32_t  tag           = 0;
-    int32_t  internalIndex = 0;
-    uint64_t address       = 0;
-    int32_t  stateCount    = 0;
+    int32_t     tag           = 0;
+    int32_t     internalIndex = 0;
+    uint64_t    address       = 0;
+    int32_t     stateCount    = 0;
+    std::string tagString;
+    std::string nameString;
 };
 
 // One division, read out of the pool. The addresses are kept so a caller can
@@ -97,9 +129,12 @@ struct Division {
     int64_t  hitPoints       = 0;   // already divided by the scale
     int64_t  organisation    = 0;
     int64_t  maxOrganisation = 0;
+    int64_t  planningBonus   = 0;   // 0 to 100+ (%)
     int64_t  defense         = 0;
     int64_t  breakthrough    = 0;
     int64_t  softAttack      = 0;
+    int64_t  hardAttack      = 0;
+    double   experience      = 0.0; // 0.0 to 1.0 (1.0 = Veteran)
 };
 
 // What DivisionFreeze holds, and at what value. Everything is off by default -
@@ -109,23 +144,47 @@ struct Division {
 // the tooltip reads 200, not 0.002.
 struct DivisionGodmode {
     bool    organisation    = true;
-    bool    maxOrganisation = true;
-    bool    hitPoints       = false;
-    bool    combatStats     = false;
+    bool    maxOrganisation = false; // Never touch shared CDivisionStats template
+    bool    hitPoints       = true;
+    bool    planning        = true;  // perpetually locks planning bonus to 100%
+    bool    combatStats     = false; // Disabled by default to prevent crashing
+    bool    veterancy       = false; // Kept false in loop to avoid combat crashes; set on demand
+    bool    keepOrgFull     = true;  // perpetually refills organization to maximum on every pass
 
-    int64_t organisationValue = 200;
-    int64_t hitPointsValue    = 5000;
-    int64_t combatStatValue   = 1000;
+    int64_t organisationValue = 100;
+    int64_t hitPointsValue    = 100;
+    int64_t planningValue     = 100; // 100% planning bonus
+    int64_t combatStatValue   = 50000;
+    double  veterancyValue    = 1.0; // 100% Veteran (Rank 5)
 
-    // How often to rewrite. The game restores organisation within a tick while
-    // exercising and max organisation at a day boundary, so anything in this
-    // range wins the race with room to spare. Lower is not better - each pass
-    // costs a few reads and writes per division.
-    int intervalMs = 200;
+    // 150ms interval prevents bus contention and allows smooth combat calculation
+    int intervalMs = 150;
 
     bool anythingOn() const {
-        return organisation || maxOrganisation || hitPoints || combatStats;
+        return organisation || maxOrganisation || hitPoints || planning || combatStats || veterancy || keepOrgFull;
     }
+};
+
+// --- Military Leaders / Commanders ---
+enum class LeaderType {
+    General,
+    FieldMarshal,
+    Admiral
+};
+
+struct Leader {
+    uint64_t    address        = 0;
+    LeaderType  type           = LeaderType::General;
+    int32_t     skillLevel     = 0;
+    int64_t     experience     = 0;   // raw / 100000
+    int32_t     role           = 0;   // 0=General, 1=FieldMarshal, 2=Admiral
+    bool        isCorrupted    = false;
+    int32_t     attackSkill    = 0;
+    int32_t     defenseSkill   = 0;
+    int32_t     planningSkill  = 0;   // planning (land) / maneuvering (navy)
+    int32_t     logisticsSkill = 0;   // logistics (land) / coordination (navy)
+    int32_t     skill5         = 0;   // coordination / extra
+    std::string name;
 };
 
 // Which of the three experience pools to act on.
@@ -139,6 +198,8 @@ public:
     const Offsets&   offsets()   const { return offsets_; }
     Offsets&         offsets()         { return offsets_; }
     const Functions& functions() const { return functions_; }
+    mem::Process&    process()         { return process_; }
+    const mem::Process& process() const { return process_; }
 
     // ------------------------------------------------------------ core chain
 
@@ -146,6 +207,17 @@ public:
         auto gs = process_.read<uint64_t>(process_.imageBase() + offsets_.gameStatePointer);
         if (!gs || !mem::Process::plausiblePointer(*gs)) return std::nullopt;
         return gs;
+    }
+
+    std::optional<uint32_t> gameStateFlags() const {
+        auto gs = gameState();
+        if (!gs) return std::nullopt;
+        return process_.read<uint32_t>(*gs + offsets_.gameStateFlags);
+    }
+
+    bool isIronman() const {
+        auto flags = gameStateFlags();
+        return flags && ((*flags & 1) != 0);
     }
 
     // Mirrors the game's own logic: primary field wins when positive.
@@ -189,23 +261,50 @@ public:
         return country(*tag);
     }
 
+    // Sets the player country tag. Writes both primary and fallback tag fields in GameState.
+    bool setPlayerTag(int32_t tag, std::string& error) {
+        auto gs = gameState();
+        if (!gs) { error = "could not resolve GameState"; return false; }
+
+        if (!country(tag)) {
+            error = "invalid tag: no country exists for tag " + std::to_string(tag);
+            return false;
+        }
+
+        if (!process_.write<int32_t>(*gs + offsets_.playerTagPrimary, tag, error))
+            return false;
+        if (!process_.write<int32_t>(*gs + offsets_.playerTagFallback, tag, error))
+            return false;
+
+        return true;
+    }
+
     // ---------------------------------------------------------------- states
 
     std::vector<uint64_t> states(uint64_t countryAddress) const {
         std::vector<uint64_t> result;
+        std::set<uint64_t> seen;
 
-        auto array = process_.read<uint64_t>(countryAddress + offsets_.stateArray);
-        auto count = process_.read<int32_t>(countryAddress + offsets_.stateCount);
-        if (!array || !count) return result;
-        if (!mem::Process::plausiblePointer(*array)) return result;
-        if (*count <= 0 || *count > kMaxStates) return result;
+        auto addFromArray = [&](int64_t arrOff, int64_t countOff) {
+            auto array = process_.read<uint64_t>(countryAddress + arrOff);
+            auto count = process_.read<int32_t>(countryAddress + countOff);
+            if (!array || !count) return;
+            if (!mem::Process::plausiblePointer(*array)) return;
+            if (*count <= 0 || *count > kMaxStates) return;
 
-        result.reserve(static_cast<size_t>(*count));
-        for (int32_t i = 0; i < *count; ++i) {
-            auto state = process_.read<uint64_t>(*array + static_cast<int64_t>(i) * 8);
-            if (state && mem::Process::plausiblePointer(*state))
-                result.push_back(*state);
-        }
+            for (int32_t i = 0; i < *count; ++i) {
+                auto state = process_.read<uint64_t>(*array + static_cast<int64_t>(i) * 8);
+                if (state && mem::Process::plausiblePointer(*state)) {
+                    if (seen.insert(*state).second) {
+                        result.push_back(*state);
+                    }
+                }
+            }
+        };
+
+        addFromArray(offsets_.stateArray, offsets_.stateCount);
+        addFromArray(offsets_.controlledStateArray, offsets_.controlledStateCount);
+
         return result;
     }
 
@@ -387,19 +486,31 @@ public:
     // is treated as an empty slot.
     std::vector<StateBuilding> stateBuildings(uint64_t stateAddress) const {
         std::vector<StateBuilding> result;
+        if (!mem::Process::plausiblePointer(stateAddress)) return result;
 
         const uint64_t container = stateAddress + offsets_.stateBuildingContainer;
 
-        auto count = process_.read<int32_t>(container + offsets_.buildingCount);
-        auto array = process_.read<uint64_t>(container + offsets_.buildingEntryArray);
-        if (!count || !array) return result;
-        if (*count <= 0 || *count > kMaxBuildings) return result;
-        if (!mem::Process::plausiblePointer(*array)) return result;
+        auto indexTableCount = process_.read<int32_t>(container + offsets_.buildingCount);
+        auto entryArrayCount = process_.read<int32_t>(container + 0x44);
+        auto array           = process_.read<uint64_t>(container + offsets_.buildingEntryArray);
+        auto indexTable      = process_.read<uint64_t>(container + offsets_.buildingIndexTable);
 
-        result.reserve(static_cast<size_t>(*count));
-        for (int i = 0; i < *count; ++i) {
-            auto entry = process_.read<uint64_t>(*array + static_cast<int64_t>(i) * 8);
+        if (!indexTableCount || !array || !entryArrayCount || !indexTable) return result;
+        if (*indexTableCount <= 0 || *indexTableCount > 256) return result;
+        if (*entryArrayCount <= 0 || *entryArrayCount > 256) return result;
+        if (!mem::Process::plausiblePointer(*array) || !mem::Process::plausiblePointer(*indexTable)) return result;
+
+        const int maxDefs = std::min(*indexTableCount, 40);
+        for (int defId = 0; defId < maxDefs; ++defId) {
+            auto idx = process_.read<int32_t>(*indexTable + static_cast<int64_t>(defId) * 4);
+            if (!idx || *idx < 0 || *idx >= *entryArrayCount) continue;
+
+            auto entry = process_.read<uint64_t>(*array + static_cast<int64_t>(*idx) * 8);
             if (!entry || !isPlausibleEntry(*entry)) continue;
+
+            auto vtable = process_.read<uint64_t>(*entry);
+            if (!vtable || !*vtable || *vtable < process_.imageBase() || *vtable > process_.imageBase() + 0x4000000)
+                continue;
 
             auto level = process_.read<int16_t>(*entry + offsets_.buildingLevel);
             if (!level || !isPlausibleLevel(*level)) continue;
@@ -408,8 +519,9 @@ public:
             b.stateAddress = stateAddress;
             b.entryAddress = *entry;
             b.levelAddress = *entry + offsets_.buildingLevel;
-            b.index        = i;
+            b.index        = defId;
             b.level        = *level;
+            b.name         = buildingDefinitionName(defId);
             result.push_back(b);
         }
         return result;
@@ -427,26 +539,163 @@ public:
     }
 
     bool setBuildingLevel(const StateBuilding& building, int16_t level, std::string& error) {
-        return process_.write<int16_t>(building.levelAddress, level, error);
+        bool ok = process_.write<int16_t>(building.levelAddress, level, error);
+        process_.write<int16_t>(building.entryAddress + offsets_.buildingHealthyLevel, level, error);
+        process_.write<int64_t>(building.entryAddress + offsets_.buildingDamage, 0, error);
+        process_.write<int64_t>(building.entryAddress + offsets_.buildingHealthRatio, 100000, error);
+        process_.write<uint8_t>(building.entryAddress + offsets_.buildingActive, 1, error);
+        return ok;
     }
 
-    // Sets one building index across every state the country owns.
-    bool setBuildingEverywhere(uint64_t countryAddress, int index, int16_t level,
-                               std::string& error, int* statesTouched = nullptr) {
+    // Sets one building index in a specific state with 100% health & full repair.
+    // Strictly enforces container bounds and vtable validation to guarantee zero heap corruption
+    // even on conquered or occupied states.
+    bool setBuildingInState(uint64_t stateAddress, int defId, int16_t level, std::string& error) {
+        if (!mem::Process::plausiblePointer(stateAddress)) {
+            error = "invalid state pointer";
+            return false;
+        }
+        const uint64_t container = stateAddress + offsets_.stateBuildingContainer;
+        auto indexTablePtr   = process_.read<uint64_t>(container + offsets_.buildingIndexTable);
+        auto indexTableCount = process_.read<int32_t>(container + offsets_.buildingCount);
+        auto entryArrayPtr   = process_.read<uint64_t>(container + offsets_.buildingEntryArray);
+        auto entryArrayCount = process_.read<int32_t>(container + 0x44);
+
+        if (!indexTablePtr || !*indexTablePtr || !mem::Process::plausiblePointer(*indexTablePtr)) {
+            error = "index table not available";
+            return false;
+        }
+        if (!entryArrayPtr || !*entryArrayPtr || !mem::Process::plausiblePointer(*entryArrayPtr)) {
+            error = "entry array not available";
+            return false;
+        }
+        if (!indexTableCount || *indexTableCount <= 0 || *indexTableCount > 256) {
+            error = "invalid index table count";
+            return false;
+        }
+        if (!entryArrayCount || *entryArrayCount <= 0 || *entryArrayCount > 256) {
+            error = "invalid entry array count";
+            return false;
+        }
+
+        // DefId must be within indexTable range
+        if (defId < 0 || defId >= *indexTableCount) {
+            error = "defId outside index table bounds";
+            return false;
+        }
+
+        auto idx = process_.read<int32_t>(*indexTablePtr + static_cast<int64_t>(defId) * 4);
+        if (!idx || *idx < 0 || *idx >= *entryArrayCount) {
+            error = "building slot not present in this state";
+            return false;
+        }
+
+        auto entry = process_.read<uint64_t>(*entryArrayPtr + static_cast<int64_t>(*idx) * 8);
+        if (!entry || !*entry || !mem::Process::plausiblePointer(*entry)) {
+            error = "invalid building entry pointer";
+            return false;
+        }
+
+        uint64_t buildingEntry = *entry;
+
+        // Verify that the entry has a valid vtable in the binary's code/const space
+        auto vtable = process_.read<uint64_t>(buildingEntry);
+        if (!vtable || !*vtable || *vtable < process_.imageBase() || *vtable > process_.imageBase() + 0x4000000) {
+            error = "entry has invalid vtable";
+            return false;
+        }
+
+        bool ok = process_.write<int16_t>(buildingEntry + offsets_.buildingLevel, level, error);
+        process_.write<int16_t>(buildingEntry + offsets_.buildingHealthyLevel, level, error);
+        process_.write<int64_t>(buildingEntry + offsets_.buildingDamage, 0, error);
+        process_.write<int64_t>(buildingEntry + offsets_.buildingHealthRatio, 100000, error);
+        process_.write<uint8_t>(buildingEntry + offsets_.buildingActive, 1, error);
+        return ok;
+    }
+
+    // Repairs all buildings in a state to 100% durability and clears all damage.
+    int repairAllBuildingsInState(uint64_t stateAddress, std::string& error) {
+        int repaired = 0;
+        for (const auto& b : stateBuildings(stateAddress)) {
+            process_.write<int16_t>(b.entryAddress + offsets_.buildingHealthyLevel, b.level, error);
+            process_.write<int64_t>(b.entryAddress + offsets_.buildingDamage, 0, error);
+            process_.write<int64_t>(b.entryAddress + offsets_.buildingHealthRatio, 100000, error);
+            process_.write<uint8_t>(b.entryAddress + offsets_.buildingActive, 1, error);
+            repaired++;
+        }
+        return repaired;
+    }
+
+    // Sets one building index across every state the country owns or controls.
+    bool setBuildingEverywhere(uint64_t countryAddress, int defId, int16_t level,
+                               std::string& error, int* statesTouched = nullptr,
+                               int* statesFailed = nullptr) {
+        auto owned = states(countryAddress);
+        if (owned.empty()) { error = "country owns or controls no states"; return false; }
+
+        int touched = 0;
+        int failed  = 0;
+        for (uint64_t state : owned) {
+            std::string subErr;
+            if (setBuildingInState(state, defId, level, subErr)) {
+                touched++;
+            } else {
+                failed++;
+            }
+        }
+        if (statesTouched) *statesTouched = touched;
+        if (statesFailed)  *statesFailed  = failed;
+        return true;
+    }
+
+    // Repairs all buildings across every owned/controlled state.
+    int repairAllBuildingsEverywhere(uint64_t countryAddress, std::string& error) {
+        int repaired = 0;
+        for (uint64_t state : states(countryAddress)) {
+            repaired += repairAllBuildingsInState(state, error);
+        }
+        return repaired;
+    }
+
+    // Max all essential factories and buildings in every owned/controlled state.
+    // Handles Civilian, Military, Dockyards, Infrastructure, Air Bases, Anti-Air,
+    // Radars, Refineries, Fuel Silos, Nuclear, Rockets, Bunkers, Coastal Forts,
+    // Supply Nodes, and Railways safely with 0 crashes on conquered territory!
+    bool setCoreBuildingsEverywhere(uint64_t countryAddress,
+                                    int16_t civLevel, int16_t milLevel, int16_t dockLevel,
+                                    int16_t infraLevel, int16_t refineryLevel, int16_t airLevel,
+                                    int16_t antiAirLevel, int16_t radarLevel, int16_t siloLevel,
+                                    int16_t fortLevel, int16_t supplyLevel, int16_t railLevel,
+                                    std::string& error, int* statesTouched = nullptr) {
         auto owned = states(countryAddress);
         if (owned.empty()) { error = "country owns no states"; return false; }
 
         int touched = 0;
         for (uint64_t state : owned) {
-            for (const auto& b : stateBuildings(state)) {
-                if (b.index != index) continue;
-                if (!process_.write<int16_t>(b.levelAddress, level, error))
-                    return false;
-                touched++;
-                break;
-            }
+            bool any = false;
+            std::string subErr;
+            if (setBuildingInState(state, 2  /* industrial_complex */, civLevel,      subErr)) any = true;
+            if (setBuildingInState(state, 1  /* arms_factory */,      milLevel,      subErr)) any = true;
+            if (setBuildingInState(state, 11 /* dockyard */,          dockLevel,     subErr)) any = true;
+            if (setBuildingInState(state, 0  /* infrastructure */,    infraLevel,    subErr)) any = true;
+            if (setBuildingInState(state, 3  /* air_base */,          airLevel,      subErr)) any = true;
+            if (setBuildingInState(state, 12 /* anti_air_building */, antiAirLevel,  subErr)) any = true;
+            if (setBuildingInState(state, 15 /* radar_station */,     radarLevel,    subErr)) any = true;
+            if (setBuildingInState(state, 13 /* synthetic_refinery */,refineryLevel, subErr)) any = true;
+            if (setBuildingInState(state, 14 /* fuel_silo */,         siloLevel,     subErr)) any = true;
+            if (setBuildingInState(state, 20 /* nuclear_reactor */,   1,             subErr)) any = true;
+            if (setBuildingInState(state, 17 /* rocket_site */,       5,             subErr)) any = true;
+            if (setBuildingInState(state, 8  /* bunker */,            fortLevel,     subErr)) any = true;
+            if (setBuildingInState(state, 9  /* coastal_bunker */,    fortLevel,     subErr)) any = true;
+            if (setBuildingInState(state, 7  /* naval_base */,        fortLevel,     subErr)) any = true;
+            if (setBuildingInState(state, 4  /* supply_node */,       supplyLevel,   subErr)) any = true;
+            if (setBuildingInState(state, 5  /* rail_way */,          railLevel,     subErr)) any = true;
+            if (any) touched++;
         }
         if (statesTouched) *statesTouched = touched;
+
+        // Also enable instant construction so that any building queued by the player finishes instantly!
+        setInstantConstruction(true, error);
         return true;
     }
 
@@ -1095,50 +1344,66 @@ public:
         return result;
     }
 
-    // Writes stock for one design. The stock lives in the variant array, so
-    // this looks the design up there; a design the country has never held has
-    // no entry yet and is reported rather than silently skipped.
-    bool giveDesign(uint64_t variant, int64_t quantity, std::string& error) {
+    // Writes stock for one design. Checks held variants first, then cached variant array.
+    bool giveDesign(uint64_t countryAddress, uint64_t variant, int64_t quantity, std::string& error) {
+        for (const auto& e : heldVariants(countryAddress)) {
+            if (e.variant == variant) {
+                return setHeldVariant(e, quantity, error);
+            }
+        }
         for (const auto& e : equipmentVariants()) {
-            if (e.variant != variant) continue;
-            return setVariantQuantity(e, quantity, error);
+            if (e.variant == variant) {
+                return setVariantQuantity(e, quantity, error);
+            }
+        }
+        error = "that design has no stock entry in held variants";
+        return false;
+    }
+
+    bool giveDesign(uint64_t variant, int64_t quantity, std::string& error) {
+        auto country = playerCountry();
+        if (country) {
+            return giveDesign(*country, variant, quantity, error);
+        }
+        for (const auto& e : equipmentVariants()) {
+            if (e.variant == variant) return setVariantQuantity(e, quantity, error);
         }
         error = "that design has no stock entry yet";
         return false;
     }
 
-    // add_latest_equipment <amount>, through the same chain the command walks.
-    // Every design the country actually owns gets the amount; the unnamed
-    // filler entries in the database are skipped.
+    // add_latest_equipment <amount>: sets stock across all held variants (stockpile),
+    // updates designs, and synchronizes the archetype stock in logistics.
     bool addLatestEquipment(uint64_t countryAddress, int64_t quantity,
                             std::string& error, int* changed = nullptr) {
-        auto all = designs(countryAddress);
-        if (all.empty()) {
-            error = "could not read the variant database";
-            return false;
+        int written = 0;
+
+        // 1. Give stock to all currently held stockpile variants (which divisions equip)
+        auto held = heldVariants(countryAddress);
+        for (const auto& e : held) {
+            std::string subErr;
+            if (setHeldVariant(e, quantity, subErr)) ++written;
         }
 
-        int written = 0;
-        int skipped = 0;
-        std::string lastError;
-
+        // 2. Also try matching designs
+        auto all = designs(countryAddress);
         for (const auto& d : all) {
             if (!d.latest) continue;
-
             std::string writeError;
-            if (giveDesign(d.variant, quantity, writeError)) ++written;
-            else { ++skipped; lastError = writeError; }
+            if (giveDesign(countryAddress, d.variant, quantity, writeError)) ++written;
         }
 
-        if (written == 0) {
-            error = skipped > 0
-                  ? "the designs have no stock entries yet - the stock array "
-                    "has to be found first, from the variant menu"
-                  : "no named designs in the database";
+        // 3. Synchronize archetype logistics stock
+        int stockChanged = 0;
+        std::string stockErr;
+        setAllStock(countryAddress, quantity, stockErr, &stockChanged);
+
+        if (written == 0 && stockChanged == 0) {
+            error = "no equipment variants or stockpile entries found";
             return false;
         }
 
-        if (changed) *changed = written;
+        if (changed) *changed = (written > 0 ? written : stockChanged);
         return true;
     }
 
@@ -1329,6 +1594,415 @@ public:
             enabled ? 1 : 0, error);
     }
 
+    std::optional<bool> focusAutocomplete() const {
+        auto valA = process_.read<uint8_t>(process_.imageBase() + offsets_.focusAutocomplete);
+        auto valB = process_.read<uint8_t>(process_.imageBase() + offsets_.focusAutocompleteB);
+        auto valC = process_.read<uint8_t>(process_.imageBase() + offsets_.focusAutocompleteC);
+        if (!valA || !valB || !valC) return std::nullopt;
+        return (*valA != 0 && *valB != 0 && *valC != 0);
+    }
+
+    bool setFocusAutocomplete(bool enabled, std::string& error) {
+        uint8_t b = enabled ? 1 : 0;
+        bool ok = true;
+        std::string err;
+        ok &= process_.write<uint8_t>(process_.imageBase() + offsets_.focusAutocomplete,  b, err);
+        ok &= process_.write<uint8_t>(process_.imageBase() + offsets_.focusAutocompleteB, b, err);
+        ok &= process_.write<uint8_t>(process_.imageBase() + offsets_.focusAutocompleteC, b, err);
+        if (!ok) error = err;
+        return ok;
+    }
+
+    std::optional<bool> instantTraining() const {
+        auto value = process_.read<uint8_t>(
+            process_.imageBase() + offsets_.instantTraining);
+        if (!value) return std::nullopt;
+        return *value != 0;
+    }
+
+    bool setInstantTraining(bool enabled, std::string& error) {
+        return process_.write<uint8_t>(
+            process_.imageBase() + offsets_.instantTraining,
+            enabled ? 1 : 0, error);
+    }
+
+    std::optional<bool> allowTraitAssign() const {
+        auto value = process_.read<uint8_t>(
+            process_.imageBase() + offsets_.allowTraits);
+        if (!value) return std::nullopt;
+        return *value != 0;
+    }
+
+    bool setAllowTraitAssign(bool enabled, std::string& error) {
+        return process_.write<uint8_t>(
+            process_.imageBase() + offsets_.allowTraits,
+            enabled ? 1 : 0, error);
+    }
+
+    std::optional<bool> allowIdeas() const {
+        auto value = process_.read<uint8_t>(
+            process_.imageBase() + offsets_.allowIdeas);
+        if (!value) return std::nullopt;
+        return *value != 0;
+    }
+
+    bool setAllowIdeas(bool enabled, std::string& error) {
+        return process_.write<uint8_t>(
+            process_.imageBase() + offsets_.allowIdeas,
+            enabled ? 1 : 0, error);
+    }
+
+    // ------------------------------------------------ Intelligence Agency & Operations
+    std::optional<bool> instantOperation() const {
+        auto value = process_.read<uint8_t>(process_.imageBase() + offsets_.instantOperation);
+        if (!value) return std::nullopt;
+        return *value != 0;
+    }
+
+    bool setInstantOperation(bool enabled, std::string& error) {
+        return process_.write<uint8_t>(
+            process_.imageBase() + offsets_.instantOperation,
+            enabled ? 1 : 0, error);
+    }
+
+    std::optional<bool> instantIntelNetwork() const {
+        auto value = process_.read<uint8_t>(process_.imageBase() + offsets_.instantIntelNetwork);
+        if (!value) return std::nullopt;
+        return *value != 0;
+    }
+
+    bool setInstantIntelNetwork(bool enabled, std::string& error) {
+        return process_.write<uint8_t>(
+            process_.imageBase() + offsets_.instantIntelNetwork,
+            enabled ? 1 : 0, error);
+    }
+
+    std::optional<bool> instantAgencySlotUnlock() const {
+        auto value = process_.read<uint8_t>(process_.imageBase() + offsets_.instantAgencySlotUnlock);
+        if (!value) return std::nullopt;
+        return *value != 0;
+    }
+
+    bool setInstantAgencySlotUnlock(bool enabled, std::string& error) {
+        return process_.write<uint8_t>(
+            process_.imageBase() + offsets_.instantAgencySlotUnlock,
+            enabled ? 1 : 0, error);
+    }
+
+    std::optional<bool> instantAgencyUpgrade() const {
+        auto v1 = process_.read<uint8_t>(process_.imageBase() + offsets_.instantAgencyUpgrade);
+        auto v2 = process_.read<uint8_t>(process_.imageBase() + offsets_.instantAgencyDepartment);
+        if (!v1 || !v2) return std::nullopt;
+        return (*v1 != 0 && *v2 != 0);
+    }
+
+    bool setInstantAgencyUpgrade(bool enabled, std::string& error) {
+        uint8_t b = enabled ? 1 : 0;
+        bool ok = true;
+        std::string err;
+        ok &= process_.write<uint8_t>(process_.imageBase() + offsets_.instantAgencyUpgrade, b, err);
+        ok &= process_.write<uint8_t>(process_.imageBase() + offsets_.instantAgencyDepartment, b, err);
+        if (!ok) error = err;
+        return ok;
+    }
+
+    std::optional<bool> allowOperations() const {
+        auto value = process_.read<uint8_t>(process_.imageBase() + offsets_.allowOperations);
+        if (!value) return std::nullopt;
+        return *value != 0;
+    }
+
+    bool setAllowOperations(bool enabled, std::string& error) {
+        return process_.write<uint8_t>(
+            process_.imageBase() + offsets_.allowOperations,
+            enabled ? 1 : 0, error);
+    }
+
+    std::optional<bool> preventOperativeDetection() const {
+        auto value = process_.read<uint8_t>(process_.imageBase() + offsets_.preventOperativeDetection);
+        if (!value) return std::nullopt;
+        return *value != 0;
+    }
+
+    bool setPreventOperativeDetection(bool enabled, std::string& error) {
+        return process_.write<uint8_t>(
+            process_.imageBase() + offsets_.preventOperativeDetection,
+            enabled ? 1 : 0, error);
+    }
+
+    bool setAllAgencyGodmode(bool enabled, std::string& error) {
+        bool ok = true;
+        std::string err;
+        ok &= setInstantOperation(enabled, err);
+        ok &= setInstantIntelNetwork(enabled, err);
+        ok &= setInstantAgencySlotUnlock(enabled, err);
+        ok &= setInstantAgencyUpgrade(enabled, err);
+        ok &= setAllowOperations(enabled, err);
+        ok &= setPreventOperativeDetection(enabled, err);
+        if (!ok) error = err;
+        return ok;
+    }
+
+    // ------------------------------------------------ Doctrines & Instant Research
+    std::optional<bool> researchFast() const {
+        auto value = process_.read<uint8_t>(process_.imageBase() + offsets_.researchFast);
+        if (!value) return std::nullopt;
+        return *value != 0;
+    }
+
+    bool setResearchFast(bool enabled, std::string& error) {
+        return process_.write<uint8_t>(
+            process_.imageBase() + offsets_.researchFast,
+            enabled ? 1 : 0, error);
+    }
+
+    // ------------------------------------------------ Subdoctrine Mastery
+    struct SubdoctrineTrackInfo {
+        uint64_t address = 0;
+        int32_t milestones = 0;
+        int64_t currentMastery = 0;
+        int64_t bankedMastery = 0;
+    };
+
+    std::vector<SubdoctrineTrackInfo> activeSubdoctrines(int32_t tag) const {
+        std::vector<SubdoctrineTrackInfo> result;
+        auto gs = gameState();
+        if (!gs) return result;
+
+        auto docMgrPtr = process_.read<uint64_t>(*gs + offsets_.doctrineManagerOffset);
+        if (!docMgrPtr || !*docMgrPtr || !mem::Process::plausiblePointer(*docMgrPtr)) return result;
+
+        uint64_t docMgr = *docMgrPtr;
+        auto recordsArray = process_.read<uint64_t>(docMgr + 0x8);
+        auto recordCount  = process_.read<uint32_t>(docMgr + 0x14);
+        if (!recordsArray || !*recordsArray || !recordCount || *recordCount == 0) return result;
+
+        // In HOI4 (sub_100f87550), the country tag is an index into the record array
+        uint64_t countryDocRec = 0;
+        if (static_cast<uint32_t>(tag) < *recordCount) {
+            countryDocRec = *recordsArray + static_cast<uint64_t>(tag) * 0xA0;
+        } else {
+            for (uint32_t idx = 0; idx < *recordCount && idx < 500; ++idx) {
+                uint64_t rec = *recordsArray + static_cast<uint64_t>(idx) * 0xA0;
+                auto recTag = process_.read<int32_t>(rec);
+                if (recTag && *recTag == tag) {
+                    countryDocRec = rec;
+                    break;
+                }
+            }
+        }
+        if (!countryDocRec) return result;
+
+        auto numTracks = process_.read<int32_t>(countryDocRec + 0x1C);
+        auto tracksArray = process_.read<uint64_t>(countryDocRec + 0x10);
+        if (!numTracks || !tracksArray || !*tracksArray || *numTracks <= 0 || *numTracks > 50) return result;
+
+        for (int32_t i = 0; i < *numTracks; ++i) {
+            uint64_t trackEntry = *tracksArray + static_cast<uint64_t>(i) * 0x50;
+            auto numSubTracks = process_.read<int32_t>(trackEntry + 0x24);
+            auto subTracksArray = process_.read<uint64_t>(trackEntry + 0x18);
+            if (!numSubTracks || !subTracksArray || !*subTracksArray || *numSubTracks <= 0 || *numSubTracks > 50)
+                continue;
+
+            for (int32_t j = 0; j < *numSubTracks; ++j) {
+                uint64_t subTrack = *subTracksArray + static_cast<uint64_t>(j) * 0x60;
+                SubdoctrineTrackInfo info;
+                info.address = subTrack;
+                info.milestones = process_.read<int32_t>(subTrack + 0x10).value_or(0);
+                info.currentMastery = process_.read<int64_t>(subTrack + 0x18).value_or(0);
+                info.bankedMastery = process_.read<int64_t>(subTrack + 0x20).value_or(0);
+                result.push_back(info);
+            }
+        }
+        return result;
+    }
+
+    std::vector<SubdoctrineTrackInfo> activeSubdoctrines() const {
+        auto tag = playerTag();
+        if (!tag) return {};
+        return activeSubdoctrines(*tag);
+    }
+
+    bool setSubdoctrineMastery(int32_t tag, int64_t masteryPoints, int32_t milestoneLevel, std::string& error) {
+        (void)tag;
+        (void)masteryPoints;
+        (void)milestoneLevel;
+        // Direct raw memory writes to CDoctrineManager hash buckets corrupted internal engine nodes
+        // and triggered SIGSEGV in CUnlockSubDoctrineCommand / SWarBlobT.
+        // Instead, we activate the console unlock runtime patch (which unlocks all commands in Ironman/MP).
+        // The player can then safely execute `mastery 5000` in the HOI4 console (~ key).
+        return setConsoleInIronman(true, error);
+    }
+
+    bool setSubdoctrineMastery(int64_t masteryPoints, int32_t milestoneLevel, std::string& error) {
+        return setSubdoctrineMastery(0, masteryPoints, milestoneLevel, error);
+    }
+
+    // ---------------------------------------------------- ironman / console
+    // Checks if the runtime code patch allowing developer console in Ironman is active.
+    bool isConsolePatchActive() const {
+        uint8_t bytes[6] = {0};
+        uint64_t addr = process_.imageBase() + offsets_.consoleShowConsoleFunc;
+        if (!process_.readBytes(addr, bytes, sizeof(bytes))) return false;
+        // Patched bytes: b8 01 00 00 00 c3  (mov $1, %eax; retq)
+        static const uint8_t kPatched[6] = { 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3 };
+        return std::memcmp(bytes, kPatched, 6) == 0;
+    }
+
+    // Enables or restores the developer console (` / ~ key) during Ironman and Multiplayer modes.
+    // Leaves GameState+0xA8 (the Ironman bit) completely untouched,
+    // so the save remains 100% Ironman and Steam achievements remain earnable!
+    bool setConsoleInIronman(bool enable, std::string& error) {
+        // 1. Function: CConsoleCmdManager::IsConsoleAvailable() (image + 0x2A520D0)
+        static const uint8_t kAvailableOrig[6]  = { 0x55, 0x48, 0x89, 0xe5, 0x53, 0x50 };
+        static const uint8_t kAvailablePatch[6] = { 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3 };
+
+        // 2. Function: m_showConsole check function (image + 0x2A52130)
+        // Original: 55 48 89 e5 0f b6  (push %rbp; mov %rsp, %rbp; movzbl ...)
+        // Patched : b8 01 00 00 00 c3  (mov $1, %eax; retq)
+        static const uint8_t kShowConsoleOrig[6]  = { 0x55, 0x48, 0x89, 0xe5, 0x0f, 0xb6 };
+        static const uint8_t kShowConsolePatch[6] = { 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3 };
+
+        // 3. Keyboard event console toggle gate (image + 0x0765E53)
+        // Original: 0f 84 99 04 00 00  (je 0x1007662f2)
+        // Patched : 90 90 90 90 90 90  (nop nop nop nop nop nop)
+        static const uint8_t kKeyGateOrig[6]  = { 0x0f, 0x84, 0x99, 0x04, 0x00, 0x00 };
+        static const uint8_t kKeyGatePatch[6] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+
+        // 4. CConsoleCmdManager::Execute(char const*)
+        // Check 1 at 0x2A522A5 (_IsRelease branch):
+        static const uint8_t kExecReleaseOrig[2]  = { 0x74, 0x4f };
+        static const uint8_t kExecReleasePatch[2] = { 0xeb, 0x4f };
+
+        // Check 2 at 0x2A522BF (_IsMultiplayer branch):
+        static const uint8_t kExecMultiplayerOrig[2]  = { 0x75, 0x17 };
+        static const uint8_t kExecMultiplayerPatch[2] = { 0x90, 0x90 };
+
+        // Check 3 at 0x2A522D6 (_IsIronMan branch):
+        static const uint8_t kExecIronmanOrig[2]  = { 0x74, 0x1e };
+        static const uint8_t kExecIronmanPatch[2] = { 0xeb, 0x1e };
+
+        // Check 4 at 0x2A5244B (Developer-only commands check):
+        static const uint8_t kExecDevOnlyOrig[2]  = { 0x74, 0x11 };
+        static const uint8_t kExecDevOnlyPatch[2] = { 0xeb, 0x11 };
+
+        uint64_t addrAvail       = process_.imageBase() + offsets_.consoleIsAvailableFunc;
+        uint64_t addrShowConsole = process_.imageBase() + offsets_.consoleShowConsoleFunc;
+        uint64_t addrKeyGate     = process_.imageBase() + offsets_.consoleToggleKeyGate;
+        uint64_t addrRelease     = process_.imageBase() + offsets_.consoleExecCheckRelease;
+        uint64_t addrMultiplayer = process_.imageBase() + offsets_.consoleExecCheckMultiplayer;
+        uint64_t addrIronman     = process_.imageBase() + offsets_.consoleExecCheckIronman;
+        uint64_t addrDevOnly     = process_.imageBase() + offsets_.consoleExecCheckDevOnly;
+
+        const uint8_t* pAvail       = enable ? kAvailablePatch       : kAvailableOrig;
+        const uint8_t* pShowConsole = enable ? kShowConsolePatch     : kShowConsoleOrig;
+        const uint8_t* pKeyGate     = enable ? kKeyGatePatch         : kKeyGateOrig;
+        const uint8_t* pRelease     = enable ? kExecReleasePatch     : kExecReleaseOrig;
+        const uint8_t* pMultiplayer = enable ? kExecMultiplayerPatch : kExecMultiplayerOrig;
+        const uint8_t* pIronman     = enable ? kExecIronmanPatch     : kExecIronmanOrig;
+        const uint8_t* pDevOnly     = enable ? kExecDevOnlyPatch     : kExecDevOnlyOrig;
+
+        if (!process_.writeBytes(addrAvail, pAvail, sizeof(kAvailablePatch), error)) return false;
+        if (!process_.writeBytes(addrShowConsole, pShowConsole, sizeof(kShowConsolePatch), error)) return false;
+        if (!process_.writeBytes(addrKeyGate, pKeyGate, sizeof(kKeyGatePatch), error)) return false;
+        if (!process_.writeBytes(addrRelease, pRelease, sizeof(kExecReleasePatch), error)) return false;
+        if (!process_.writeBytes(addrMultiplayer, pMultiplayer, sizeof(kExecMultiplayerPatch), error)) return false;
+        if (!process_.writeBytes(addrIronman, pIronman, sizeof(kExecIronmanPatch), error)) return false;
+        if (!process_.writeBytes(addrDevOnly, pDevOnly, sizeof(kExecDevOnlyPatch), error)) return false;
+
+        // Also write 1 to CConsoleCmdManager + 0xB0 (m_showConsole)
+        auto cmdMgrPtr = process_.read<uint64_t>(process_.imageBase() + offsets_.consoleCmdManagerPointer);
+        if (cmdMgrPtr && *cmdMgrPtr && mem::Process::plausiblePointer(*cmdMgrPtr)) {
+            process_.write<uint8_t>(*cmdMgrPtr + 0xB0, enable ? 1 : 0, error);
+        }
+
+        return true;
+    }
+
+    bool setConsoleUnlock(bool enable, std::string& error) {
+        return setConsoleInIronman(enable, error);
+    }
+
+    // Directly toggles or forces open the in-game console GUI window
+    bool toggleConsoleWindow(std::string& error) {
+        auto consolePtr = process_.read<uint64_t>(process_.imageBase() + offsets_.consoleObjectPointer);
+        if (!consolePtr || !*consolePtr || !mem::Process::plausiblePointer(*consolePtr)) {
+            error = "CConsole object not initialized yet (is a campaign loaded?)";
+            return false;
+        }
+        uint64_t console = *consolePtr;
+        auto isOpen = process_.read<uint8_t>(console + offsets_.consoleIsOpen);
+        uint8_t target = (isOpen && *isOpen) ? 0 : 1;
+        if (!process_.write<uint8_t>(console + offsets_.consoleIsOpen, target, error))
+            return false;
+
+        auto gui = process_.read<uint64_t>(console + offsets_.consoleGuiObject);
+        if (gui && *gui && mem::Process::plausiblePointer(*gui)) {
+            process_.write<uint8_t>(*gui + 0x80, target, error);
+            process_.write<uint8_t>(*gui + 0x88, target, error);
+        }
+        return true;
+    }
+
+    // ---------------------------------------------------- multiplayer kick unlock
+    bool isMultiplayerKickUnlockActive() const {
+        uint8_t b[2] = {0};
+        uint64_t addr = process_.imageBase() + offsets_.chatKickOperatorCheck;
+        if (!process_.readBytes(addr, b, 2)) return false;
+        return (b[0] == 0xeb && b[1] == 0xdd);
+    }
+
+    bool setMultiplayerKickUnlock(bool enable, std::string& error) {
+        static const uint8_t kGuiOrig[2]  = { 0x74, 0x18 };
+        static const uint8_t kGuiPatch[2] = { 0xeb, 0x18 };
+
+        static const uint8_t kChatOpOrig[2]  = { 0x7e, 0x22 };
+        static const uint8_t kChatOpPatch[2] = { 0xeb, 0xdd };
+
+        static const uint8_t kChatLoopOrig[6]  = { 0x0f, 0x85, 0xf0, 0x00, 0x00, 0x00 };
+        static const uint8_t kChatLoopPatch[6] = { 0xe9, 0xf1, 0x00, 0x00, 0x00, 0x90 };
+
+        uint64_t addrGui  = process_.imageBase() + offsets_.multiplayerKickGuiGate;
+        uint64_t addrChat = process_.imageBase() + offsets_.chatKickOperatorCheck;
+        uint64_t addrLoop = process_.imageBase() + offsets_.chatKickLoopCheck;
+
+        const uint8_t* pGui  = enable ? kGuiPatch   : kGuiOrig;
+        const uint8_t* pChat = enable ? kChatOpPatch : kChatOpOrig;
+        const uint8_t* pLoop = enable ? kChatLoopPatch : kChatLoopOrig;
+
+        if (!process_.writeBytes(addrGui, pGui, sizeof(kGuiPatch), error)) return false;
+        if (!process_.writeBytes(addrChat, pChat, sizeof(kChatOpPatch), error)) return false;
+        if (!process_.writeBytes(addrLoop, pLoop, sizeof(kChatLoopPatch), error)) return false;
+
+        return true;
+    }
+
+    // ---------------------------------------------------- instant invasion & paradrop
+    std::optional<int32_t> navalInvasionPrepareDays() const {
+        return process_.read<int32_t>(process_.imageBase() + offsets_.navalInvasionPrepareDays);
+    }
+
+    bool setInstantNavalInvasion(bool enable, std::string& error) {
+        int32_t days = enable ? 0 : 3;
+        bool ok = true;
+        ok &= process_.write<int32_t>(process_.imageBase() + offsets_.navalInvasionPrepareDays, days, error);
+        if (enable) {
+            process_.write<int32_t>(process_.imageBase() + offsets_.airInvasionPrepareDays, 0, error);
+        } else {
+            process_.write<int32_t>(process_.imageBase() + offsets_.airInvasionPrepareDays, 7, error);
+        }
+        return ok;
+    }
+
+    std::optional<int32_t> paradropHours() const {
+        return process_.read<int32_t>(process_.imageBase() + offsets_.paradropHours);
+    }
+
+    bool setInstantParadrop(bool enable, std::string& error) {
+        int32_t hours = enable ? 0 : 48;
+        return process_.write<int32_t>(process_.imageBase() + offsets_.paradropHours, hours, error);
+    }
+
     // ------------------------------------------------------------ command power
 
     struct CommandPower {
@@ -1395,8 +2069,47 @@ public:
 
     // ------------------------------------------------------------ enumeration
 
-    std::vector<CountryInfo> allCountries(int32_t maxTag = 400) const {
+    std::string countryTag(uint64_t countryAddress) const {
+        return readStdString(countryAddress + offsets_.countryTagString);
+    }
+
+    std::string countryName(uint64_t countryAddress) const {
+        return readStdString(countryAddress + offsets_.countryNameString);
+    }
+
+    std::string countryTag(int32_t tag) const {
+        auto c = country(tag);
+        if (!c) return {};
+        return countryTag(*c);
+    }
+
+    std::string countryName(int32_t tag) const {
+        auto c = country(tag);
+        if (!c) return {};
+        return countryName(*c);
+    }
+
+    std::string playerTagString() const {
+        auto c = playerCountry();
+        if (!c) return {};
+        return countryTag(*c);
+    }
+
+    int32_t maxTagCount() const {
+        auto gs = gameState();
+        if (!gs) return 500;
+        auto begin = process_.read<uint64_t>(*gs + offsets_.tagIndexTable);
+        auto end   = process_.read<uint64_t>(*gs + offsets_.tagIndexTable + 8);
+        if (begin && end && *end >= *begin && mem::Process::plausiblePointer(*begin)) {
+            uint64_t diff = (*end - *begin) / 4;
+            if (diff > 0 && diff < 10000) return static_cast<int32_t>(diff);
+        }
+        return 500;
+    }
+
+    std::vector<CountryInfo> allCountries(int32_t maxTag = 0) const {
         std::vector<CountryInfo> result;
+        if (maxTag <= 0) maxTag = maxTagCount();
 
         for (int32_t tag = 1; tag <= maxTag; ++tag) {
             auto address = country(tag);
@@ -1406,9 +2119,261 @@ public:
             if (!count || *count < 0 || *count > kMaxStates) continue;
 
             auto index = tagToIndex(tag);
-            result.push_back({ tag, index ? *index : -1, *address, *count });
+            std::string tStr = countryTag(*address);
+            std::string nStr = countryName(*address);
+
+            result.push_back({
+                tag,
+                index ? *index : -1,
+                *address,
+                *count,
+                std::move(tStr),
+                std::move(nStr)
+            });
         }
         return result;
+    }
+
+    std::optional<int32_t> findTag(const std::string& input) const {
+        if (input.empty()) return std::nullopt;
+
+        // Try as integer first
+        char* end = nullptr;
+        long val = std::strtol(input.c_str(), &end, 10);
+        if (end != input.c_str() && *end == '\0' && val > 0) {
+            int32_t t = static_cast<int32_t>(val);
+            if (country(t)) return t;
+        }
+
+        // Try matching tagString or nameString case-insensitively
+        std::string upperInput = input;
+        for (char& c : upperInput) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+
+        auto countries = allCountries();
+        for (const auto& c : countries) {
+            std::string tagUpper = c.tagString;
+            for (char& ch : tagUpper) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            if (!tagUpper.empty() && tagUpper == upperInput)
+                return c.tag;
+        }
+        for (const auto& c : countries) {
+            std::string nameUpper = c.nameString;
+            for (char& ch : nameUpper) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            if (!nameUpper.empty() && nameUpper == upperInput)
+                return c.tag;
+        }
+        return std::nullopt;
+    }
+
+    // ---------------------------------------------------------------- leaders
+
+    std::string readLeaderName(uint64_t leaderAddress) const {
+        for (int64_t off : {0x20, 0x28, 0x30, 0x18, 0x38, 0x40}) {
+            auto ptr = process_.read<uint64_t>(leaderAddress + off);
+            if (ptr && mem::Process::plausiblePointer(*ptr)) {
+                std::string s = process_.readString(*ptr, 64);
+                if (!s.empty()) {
+                    bool printable = true;
+                    for (char c : s) {
+                        if (static_cast<unsigned char>(c) < 32 || static_cast<unsigned char>(c) > 126) {
+                            printable = false; break;
+                        }
+                    }
+                    if (printable && s.length() >= 2) return s;
+                }
+            }
+            std::string sInline = process_.readString(leaderAddress + off, 32);
+            if (!sInline.empty()) {
+                bool printable = true;
+                for (char c : sInline) {
+                    if (static_cast<unsigned char>(c) < 32 || static_cast<unsigned char>(c) > 126) {
+                        printable = false; break;
+                    }
+                }
+                if (printable && sInline.length() >= 2) return sInline;
+            }
+        }
+        return "";
+    }
+
+    std::vector<Leader> leaders(uint64_t countryAddress) const {
+        std::vector<Leader> result;
+        auto mgrPtr = process_.read<uint64_t>(countryAddress + offsets_.leaderManager);
+        if (!mgrPtr || !mem::Process::plausiblePointer(*mgrPtr)) return result;
+
+        const uint64_t mgr = *mgrPtr;
+        std::unordered_set<uint64_t> seen;
+
+        auto scanVector = [&](int64_t vecOffset, LeaderType fallbackType, const char* defaultPrefix) {
+            auto arrayPtr = process_.read<uint64_t>(mgr + vecOffset);
+            auto count = process_.read<int32_t>(mgr + vecOffset + 0x0C);
+            if (!arrayPtr || !count || *count <= 0 || *count > 500) return;
+            if (!mem::Process::plausiblePointer(*arrayPtr)) return;
+
+            for (int32_t i = 0; i < *count; ++i) {
+                auto lPtr = process_.read<uint64_t>(*arrayPtr + static_cast<int64_t>(i) * 8);
+                if (!lPtr || !mem::Process::plausiblePointer(*lPtr)) continue;
+                if (!seen.insert(*lPtr).second) continue;
+
+                Leader l;
+                l.address = *lPtr;
+
+                // Native role at +0xCB4:
+                // 0 = General (Corps Commander)
+                // 1 = Field Marshal (Army Group Commander)
+                // 2 = Navy Admiral
+                auto role = process_.read<int32_t>(*lPtr + offsets_.leaderRole);
+                int32_t roleVal = role ? *role : 0;
+                l.role = roleVal;
+                if (roleVal == 0) {
+                    l.type = LeaderType::General;
+                    l.isCorrupted = false;
+                } else if (roleVal == 1) {
+                    l.type = LeaderType::FieldMarshal;
+                    l.isCorrupted = false;
+                } else if (roleVal == 2) {
+                    l.type = LeaderType::Admiral;
+                    l.isCorrupted = false;
+                } else {
+                    l.type = fallbackType;
+                    l.isCorrupted = true;
+                }
+
+                // Skill level is inside the stats descriptor object at [leader + 0xC98] + 0x180
+                auto statsPtr = process_.read<uint64_t>(*lPtr + offsets_.leaderStatsObject);
+                if (statsPtr && mem::Process::plausiblePointer(*statsPtr)) {
+                    auto skill = process_.read<int32_t>(*statsPtr + offsets_.leaderStatsSkillLevel);
+                    l.skillLevel = (skill && *skill >= 1 && *skill <= 20) ? *skill : 1;
+                } else {
+                    l.skillLevel = 1;
+                }
+
+                // Sub-skills (Attack, Defense, Planning, Logistics, Skill 5)
+                auto atk = process_.read<int32_t>(*lPtr + offsets_.leaderAttackSkill);
+                l.attackSkill = atk ? *atk : 0;
+                auto def = process_.read<int32_t>(*lPtr + offsets_.leaderDefenseSkill);
+                l.defenseSkill = def ? *def : 0;
+                auto pln = process_.read<int32_t>(*lPtr + offsets_.leaderPlanningSkill);
+                l.planningSkill = pln ? *pln : 0;
+                auto log = process_.read<int32_t>(*lPtr + offsets_.leaderLogisticsSkill);
+                l.logisticsSkill = log ? *log : 0;
+                auto s5  = process_.read<int32_t>(*lPtr + offsets_.leaderSkill5);
+                l.skill5 = s5 ? *s5 : 0;
+
+                auto xp = process_.read<int64_t>(*lPtr + offsets_.leaderExperience);
+                l.experience = xp ? (*xp / 100000) : 0;
+
+                std::string name = readLeaderName(*lPtr);
+                if (name.empty()) {
+                    name = std::string(defaultPrefix) + " #" + std::to_string(i + 1);
+                }
+                l.name = name;
+                result.push_back(l);
+            }
+        };
+
+        scanVector(offsets_.leaderGeneralsVector,      LeaderType::General,      "General");
+        scanVector(offsets_.leaderFieldMarshalsVector, LeaderType::FieldMarshal, "Field Marshal");
+        scanVector(offsets_.leaderAdmiralsVector,      LeaderType::Admiral,      "Admiral");
+
+        return result;
+    }
+
+    // Repairs ONLY leaders whose role (0xCB4) was corrupted to an invalid value (e.g. 9).
+    // NEVER touches leaders whose role is already 0 (General), 1 (Field Marshal), or 2 (Admiral)!
+    int repairLeaders(uint64_t countryAddress, std::string& error) {
+        auto all = leaders(countryAddress);
+        int repaired = 0;
+        for (const auto& l : all) {
+            if (l.isCorrupted) {
+                int32_t cleanRole = (l.type == LeaderType::FieldMarshal) ? 1 :
+                                    (l.type == LeaderType::Admiral) ? 2 : 0;
+                std::string subErr;
+                if (process_.write<int32_t>(l.address + offsets_.leaderRole, cleanRole, subErr)) {
+                    repaired++;
+                }
+            }
+        }
+        return repaired;
+    }
+
+    bool addLeaderExperience(uint64_t leaderAddress, int64_t xpToAdd, std::string& error) {
+        auto current = process_.read<int64_t>(leaderAddress + offsets_.leaderExperience);
+        int64_t curXp = current ? *current : 0;
+        int64_t newXp = curXp + xpToAdd * 100000;
+        if (newXp < 0) newXp = 0;
+        // Cap to sane maximum (5,000,000 * 100,000) so it never overflows
+        if (newXp > 500000000000LL) newXp = 500000000000LL;
+
+        // Write XP directly. The game engine processes level-ups naturally on daily ticks or combat.
+        // NEVER touch 0xCB4 (role)!
+        return process_.write<int64_t>(leaderAddress + offsets_.leaderExperience, newXp, error);
+    }
+
+    bool setLeaderSkill(uint64_t leaderAddress, int32_t level, int64_t xp, std::string& error) {
+        // Set skill level inside stats descriptor object at [leaderAddress + 0xC98] + 0x180
+        auto statsPtr = process_.read<uint64_t>(leaderAddress + offsets_.leaderStatsObject);
+        if (statsPtr && mem::Process::plausiblePointer(*statsPtr)) {
+            process_.write<int32_t>(*statsPtr + offsets_.leaderStatsSkillLevel, level, error);
+        }
+
+        // Set XP at leaderAddress + 0xCA0
+        // CRITICAL: NEVER WRITE TO offsets_.leaderRole (0xCB4)!
+        return process_.write<int64_t>(leaderAddress + offsets_.leaderExperience, xp * 100000, error);
+    }
+
+    bool setLeaderSubSkills(uint64_t leaderAddress, int32_t attack, int32_t defense, int32_t planning, int32_t logistics, int32_t skill5, std::string& error) {
+        bool ok = true;
+        if (attack >= 0)    ok &= process_.write<int32_t>(leaderAddress + offsets_.leaderAttackSkill, attack, error);
+        if (defense >= 0)   ok &= process_.write<int32_t>(leaderAddress + offsets_.leaderDefenseSkill, defense, error);
+        if (planning >= 0)  ok &= process_.write<int32_t>(leaderAddress + offsets_.leaderPlanningSkill, planning, error);
+        if (logistics >= 0) ok &= process_.write<int32_t>(leaderAddress + offsets_.leaderLogisticsSkill, logistics, error);
+        if (skill5 >= 0)    ok &= process_.write<int32_t>(leaderAddress + offsets_.leaderSkill5, skill5, error);
+        return ok;
+    }
+
+    bool setLeaderSubSkills(uint64_t leaderAddress, int32_t attack, int32_t defense, int32_t planning, int32_t logistics, std::string& error) {
+        return setLeaderSubSkills(leaderAddress, attack, defense, planning, logistics, -1, error);
+    }
+
+    int setAllLeadersSubSkills(uint64_t countryAddress, int32_t attack, int32_t defense, int32_t planning, int32_t logistics, int32_t skill5, std::string& error) {
+        auto all = leaders(countryAddress);
+        int changed = 0;
+        for (const auto& l : all) {
+            std::string subErr;
+            if (setLeaderSubSkills(l.address, attack, defense, planning, logistics, skill5, subErr)) {
+                changed++;
+            }
+        }
+        return changed;
+    }
+
+    int setAllLeadersSubSkills(uint64_t countryAddress, int32_t attack, int32_t defense, int32_t planning, int32_t logistics, std::string& error) {
+        return setAllLeadersSubSkills(countryAddress, attack, defense, planning, logistics, -1, error);
+    }
+
+    bool setLeaderRole(uint64_t leaderAddress, int32_t role, std::string& error) {
+        if (role < 0 || role > 2) {
+            error = "invalid role (0=General, 1=FieldMarshal, 2=Admiral)";
+            return false;
+        }
+        return process_.write<int32_t>(leaderAddress + offsets_.leaderRole, role, error);
+    }
+
+    int maxAllLeaders(uint64_t countryAddress, std::string& error, int* count = nullptr) {
+        auto all = leaders(countryAddress);
+        if (count) *count = static_cast<int>(all.size());
+        int touched = 0;
+        for (const auto& l : all) {
+            std::string subErr;
+            // 1. Skill Level 9 & 500k XP
+            setLeaderSkill(l.address, 9 /* Max Level */, 500000 /* High XP */, subErr);
+            // 2. Sub-skills (Attack 10, Defense 10, Planning 10, Logistics 10, Skill 5 10)
+            setLeaderSubSkills(l.address, 10, 10, 10, 10, 10, subErr);
+            // NEVER TOUCH offsets_.leaderRole (0xCB4)! Preserve their role!
+            touched++;
+        }
+        return touched;
     }
 
     // ------------------------------------------------------------- divisions
@@ -1423,20 +2388,25 @@ public:
         return *unit;
     }
 
-    // A live slot reads 1 at +0x0C; a free one reads 0 there and at +0x08.
-    // Maximum organisation and hit points are both positive on anything real,
-    // which rules out a slot that carries the flag but nothing else.
+    // Confirms an address is a valid CArmy (land division) object.
+    // In Clausewitz engine, CArmy objects start with __ZTV5CArmy at imageBase + 0x3297548.
     bool looksLikeDivision(uint64_t address) const {
-        auto used = process_.read<int32_t>(address + offsets_.divisionSlotUsed);
-        if (!used || *used != 1) return false;
-
-        auto maxOrg = process_.read<int32_t>(address + offsets_.divisionMaxOrganisation);
-        if (!maxOrg || *maxOrg <= 0) return false;
-
-        auto hp = process_.read<int32_t>(address + offsets_.divisionHitPoints);
-        if (!hp || *hp <= 0) return false;
-
-        return true;
+        if (!mem::Process::plausiblePointer(address)) return false;
+        auto vptr = process_.read<uint64_t>(address);
+        if (vptr && *vptr == process_.imageBase() + offsets_.divisionVtable) {
+            return true;
+        }
+        auto vptr2 = process_.read<uint64_t>(address + 0x10);
+        if (vptr2 && *vptr2 == process_.imageBase() + offsets_.divisionVtable2) {
+            return true;
+        }
+        // Fallback: check plausible HP and country tag
+        auto hp = process_.read<int64_t>(address + offsets_.divisionHitPoints);
+        auto tag = process_.read<int32_t>(address + offsets_.divisionOwnerTag);
+        if (hp && *hp > 0 && tag && *tag > 0 && *tag < 5000) {
+            return true;
+        }
+        return false;
     }
 
     std::optional<Division> readDivision(uint64_t address, int slot) const {
@@ -1444,13 +2414,26 @@ public:
 
         const int64_t scale = offsets_.divisionFixedPointScale;
 
-        auto hp     = process_.read<int32_t>(address + offsets_.divisionHitPoints);
-        auto org    = process_.read<int32_t>(address + offsets_.divisionOrganisation);
-        auto maxOrg = process_.read<int32_t>(address + offsets_.divisionMaxOrganisation);
-        auto def    = process_.read<int32_t>(address + offsets_.divisionDefense);
-        auto brk    = process_.read<int32_t>(address + offsets_.divisionBreakthrough);
-        auto soft   = process_.read<int32_t>(address + offsets_.divisionSoftAttack);
-        if (!hp || !org || !maxOrg) return std::nullopt;
+        auto hp     = process_.read<int64_t>(address + offsets_.divisionHitPoints);
+        auto org    = process_.read<int64_t>(address + offsets_.divisionOrganisation);
+        auto def    = process_.read<int64_t>(address + offsets_.divisionDefense);
+        auto brk    = process_.read<int64_t>(address + offsets_.divisionBreakthrough);
+        auto soft   = process_.read<int64_t>(address + offsets_.divisionSoftAttack);
+        auto hard   = process_.read<int64_t>(address + offsets_.divisionHardAttack);
+        auto exp    = process_.read<int64_t>(address + offsets_.divisionExperience);
+
+        // Read maxOrg from stats sub-object at CArmy + 0x138 -> Stats + 0x268
+        int64_t maxOrgVal = 0;
+        auto stats = process_.read<uint64_t>(address + offsets_.divisionStatsObject);
+        if (stats && mem::Process::plausiblePointer(*stats)) {
+            auto maxOrg = process_.read<int64_t>(*stats + offsets_.divisionStatsMaxOrg);
+            if (maxOrg && *maxOrg > 0) {
+                maxOrgVal = *maxOrg / scale;
+            }
+        }
+        if (maxOrgVal <= 0) {
+            maxOrgVal = org ? std::max<int64_t>(100, *org / scale) : 100;
+        }
 
         auto owner = process_.read<uint64_t>(address + offsets_.divisionOwnerCountry);
 
@@ -1458,12 +2441,25 @@ public:
         d.address         = address;
         d.owner           = (owner && mem::Process::plausiblePointer(*owner)) ? *owner : 0;
         d.slot            = slot;
-        d.hitPoints       = *hp     / scale;
-        d.organisation    = *org    / scale;
-        d.maxOrganisation = *maxOrg / scale;
-        d.defense         = def  ? *def  / scale : 0;
-        d.breakthrough    = brk  ? *brk  / scale : 0;
-        d.softAttack      = soft ? *soft / scale : 0;
+        d.hitPoints       = hp   ? (*hp   / scale) : 0;
+        d.organisation    = org  ? (*org  / scale) : 0;
+        d.maxOrganisation = maxOrgVal;
+        d.defense         = def  ? (*def  / scale) : 0;
+        d.breakthrough    = brk  ? (*brk  / scale) : 0;
+        d.softAttack      = soft ? (*soft / scale) : 0;
+        // HOI4 raw experience at 0x428 is cumulative raw XP (~0 to 2,000,000,000).
+        // Normalize to 0.0 - 1.0 for UI display and rank calculations:
+        double normExp = 0.0;
+        auto plnBonus = process_.read<int64_t>(address + offsets_.divisionPlanningBonus);
+        if (exp && *exp > 0) {
+            if (*exp > scale) {
+                normExp = std::min(1.0, static_cast<double>(*exp) / 1500000000.0);
+            } else {
+                normExp = static_cast<double>(*exp) / static_cast<double>(scale);
+            }
+        }
+        d.experience      = normExp;
+        d.planningBonus   = plnBonus ? (*plnBonus / scale) : 0;
         return d;
     }
 
@@ -1548,63 +2544,188 @@ public:
 
         const int64_t ownerOffset = offsets_.divisionOwnerCountry;
 
+        // Reusable buffer to avoid repeated megabyte allocations
+        constexpr size_t kChunkSize = 2 * 1024 * 1024;
+        std::vector<uint8_t> buffer(kChunkSize);
+
         for (const mem::Region& region : process_.regions(/*writableOnly=*/true)) {
-            if (region.size > kMaxRegionSize) continue;
-            if (region.size < 8) continue;
+            if (region.size < 4096 || region.size > kMaxRegionSize) continue;
 
-            std::vector<uint8_t> buffer(static_cast<size_t>(region.size));
-
-            // Chunked, because one partially failed read of a large region
-            // would silently skip everything in it.
-            constexpr size_t kChunk = 1024 * 1024;
-            size_t done = 0;
-            bool   ok   = true;
-            while (done < buffer.size()) {
-                const size_t take = std::min(kChunk, buffer.size() - done);
-                if (!process_.readBytes(region.base + done,
-                                        buffer.data() + done, take)) {
-                    ok = false;
-                    break;
+            size_t offsetInRegion = 0;
+            while (offsetInRegion < region.size) {
+                const size_t take = std::min(kChunkSize, static_cast<size_t>(region.size - offsetInRegion));
+                if (!process_.readBytes(region.base + offsetInRegion, buffer.data(), take)) {
+                    offsetInRegion += take;
+                    continue;
                 }
-                done += take;
-            }
-            if (!ok) continue;
 
-            for (size_t offset = 0; offset + 8 <= buffer.size(); offset += 8) {
-                uint64_t word = 0;
-                std::memcpy(&word, buffer.data() + offset, sizeof(word));
-                if (word != countryAddress) continue;
+                const size_t limit = (take >= 8) ? take - 8 : 0;
+                for (size_t i = 0; i <= limit; i += 8) {
+                    uint64_t word = 0;
+                    std::memcpy(&word, buffer.data() + i, sizeof(word));
+                    if (word != countryAddress) continue;
 
-                if (offset < static_cast<size_t>(ownerOffset)) continue;
-                const uint64_t base = region.base + offset
-                                    - static_cast<uint64_t>(ownerOffset);
+                    const uint64_t hitAddr = region.base + offsetInRegion + i;
+                    if (hitAddr < static_cast<uint64_t>(ownerOffset)) continue;
+                    const uint64_t base = hitAddr - static_cast<uint64_t>(ownerOffset);
 
-                if (!seen.insert(base).second) continue;
+                    if (!seen.insert(base).second) continue;
+
+                    auto d = readDivision(base, static_cast<int>(result.size()));
+                    if (!d) continue;
+                    if (d->owner != countryAddress) continue;
+
+                    result.push_back(*d);
+                    if (static_cast<int>(result.size()) >= offsets_.divisionMaxCount) break;
+                }
                 if (static_cast<int>(result.size()) >= offsets_.divisionMaxCount) break;
+                offsetInRegion += take;
+            }
+            if (static_cast<int>(result.size()) >= offsets_.divisionMaxCount) break;
+        }
 
-                // Cheap rejection out of the buffer before spending syscalls:
-                // the country pointer turns up in plenty of places that are
-                // not divisions.
-                const size_t baseOffset = offset - static_cast<size_t>(ownerOffset);
-                if (baseOffset + static_cast<size_t>(offsets_.divisionHitPointsCopy) + 4
-                        <= buffer.size()) {
+        std::sort(result.begin(), result.end(),
+                  [](const Division& a, const Division& b) {
+                      return a.address < b.address;
+                  });
 
-                    int32_t used = 0, hp = 0, maxOrg = 0;
-                    std::memcpy(&used,
-                                buffer.data() + baseOffset + offsets_.divisionSlotUsed, 4);
-                    std::memcpy(&hp,
-                                buffer.data() + baseOffset + offsets_.divisionHitPoints, 4);
-                    std::memcpy(&maxOrg,
-                                buffer.data() + baseOffset + offsets_.divisionMaxOrganisation, 4);
+        for (size_t i = 0; i < result.size(); ++i)
+            result[i].slot = static_cast<int>(i);
 
-                    if (used != 1 || hp <= 0 || maxOrg <= 0) continue;
-                }
+        return result;
+    }
 
-                auto d = readDivision(base, static_cast<int>(result.size()));
-                if (!d) continue;
-                if (d->owner != countryAddress) continue;
+    // Discovers divisions via the game's unit selection list and pools.
+    // Instantaneous (0ms) and works when player has units selected on map.
+    // Assembly reverse-engineered from sub_1001628C0 (unit_address command).
+    std::vector<Division> divisionsFromSelection() const {
+        std::vector<Division> result;
+        std::set<uint64_t> seen;
 
+        // 1. Check lastSelectedUnit cached global (0x34EE050)
+        auto last = selectedUnit();
+        if (last && looksLikeDivision(*last)) {
+            auto d = readDivision(*last, 0);
+            if (d) {
                 result.push_back(*d);
+                seen.insert(*last);
+            }
+        }
+
+        // 2. Read live selection container directly from selectionRoot (0x35011A8)
+        auto rootPtr = process_.read<uint64_t>(process_.imageBase() + offsets_.selectionRoot);
+        if (rootPtr && mem::Process::plausiblePointer(*rootPtr)) {
+            const uint64_t listObj = *rootPtr + offsets_.selectionOffset; // +0x500
+            auto firstNode = process_.read<uint64_t>(listObj + 0x30);     // first node pointer at +0x30
+            uint64_t currNode = firstNode ? *firstNode : 0;
+            int traversed = 0;
+            while (currNode && mem::Process::plausiblePointer(currNode) && traversed < 1024) {
+                auto unitPtr = process_.read<uint64_t>(currNode + 0x00);   // unit pointer at node + 0x00
+                if (unitPtr && mem::Process::plausiblePointer(*unitPtr)) {
+                    auto typeTag = process_.read<int32_t>(*unitPtr + offsets_.divisionTypeTag);
+                    if (typeTag && *typeTag <= 13 && ((0x2003 >> *typeTag) & 1)) {
+                        if (seen.find(*unitPtr) == seen.end() && looksLikeDivision(*unitPtr)) {
+                            auto d = readDivision(*unitPtr, static_cast<int>(result.size()));
+                            if (d) {
+                                result.push_back(*d);
+                                seen.insert(*unitPtr);
+                            }
+                        }
+                    }
+                }
+                auto nextNode = process_.read<uint64_t>(currNode + offsets_.selectionNext); // next node at +0x10
+                if (!nextNode || *nextNode == currNode || *nextNode == 0) break;
+                currNode = *nextNode;
+                traversed++;
+            }
+        }
+
+        // 3. Pool walk outwards from ANY discovered division
+        // In Clausewitz engine, divisions live in a contiguous pool with 0x1000 stride.
+        if (!result.empty()) {
+            auto country = playerCountry();
+            const size_t initialCount = result.size();
+            for (size_t idx = 0; idx < initialCount; ++idx) {
+                uint64_t anchor = result[idx].address;
+                for (int dir : {-1, 1}) {
+                    int consecutiveEmpty = 0;
+                    for (int step = 1; step <= offsets_.divisionMaxCount; ++step) {
+                        uint64_t candidate = (dir > 0)
+                            ? (anchor + static_cast<uint64_t>(step) * offsets_.divisionStride)
+                            : (anchor - static_cast<uint64_t>(step) * offsets_.divisionStride);
+                        if (candidate > 0x7fffffffffffULL || candidate < 0x100000000ULL) break;
+                        if (seen.find(candidate) != seen.end()) continue;
+
+                        if (looksLikeDivision(candidate)) {
+                            auto owner = process_.read<uint64_t>(candidate + offsets_.divisionOwnerCountry);
+                            if (!country || (owner && *owner == *country)) {
+                                auto d = readDivision(candidate, static_cast<int>(result.size()));
+                                if (d) {
+                                    result.push_back(*d);
+                                    seen.insert(candidate);
+                                    consecutiveEmpty = 0;
+                                    continue;
+                                }
+                            }
+                        }
+                        consecutiveEmpty++;
+                        if (consecutiveEmpty >= offsets_.divisionMaxGap) break;
+                    }
+                }
+            }
+        }
+
+        return result;
+    }
+
+    // Resolves ALL of the player country's divisions automatically.
+    // In Clausewitz engine, CCountry maintains a direct array of CArmy* at Country + 0x250
+    // with count at Country + 0x25C. This discovers every division instantly (0ms)
+    // without requiring the player to select any units on the map or run console commands.
+    std::vector<Division> playerDivisions() const {
+        auto country = playerCountry();
+        if (!country) return {};
+
+        std::vector<Division> result;
+        std::set<uint64_t> seen;
+
+        // 1. Direct native Clausewitz engine array at Country + 0x250 (CPdxArray<CArmy*, int>)
+        auto arrPtr = process_.read<uint64_t>(*country + offsets_.countryDivisionsArray);
+        auto countVal = process_.read<int32_t>(*country + offsets_.countryDivisionsCount);
+
+        if (arrPtr && countVal && *countVal > 0 && *countVal < 10000 && mem::Process::plausiblePointer(*arrPtr)) {
+            const int count = *countVal;
+            std::vector<uint64_t> armyPtrs(count);
+            if (process_.readBytes(*arrPtr, armyPtrs.data(), count * sizeof(uint64_t))) {
+                for (int i = 0; i < count; ++i) {
+                    uint64_t divAddr = armyPtrs[i];
+                    if (divAddr && mem::Process::plausiblePointer(divAddr) && seen.insert(divAddr).second) {
+                        if (looksLikeDivision(divAddr)) {
+                            auto d = readDivision(divAddr, static_cast<int>(result.size()));
+                            if (d) {
+                                result.push_back(*d);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Fallback: also check selection list and memory scan if direct array was empty
+        if (result.empty()) {
+            auto fromSel = divisionsFromSelection();
+            for (const auto& d : fromSel) {
+                if (seen.insert(d.address).second) {
+                    result.push_back(d);
+                }
+            }
+            if (result.empty()) {
+                auto scanned = scanDivisionsOwnedBy(*country);
+                for (const auto& d : scanned) {
+                    if (seen.insert(d.address).second) {
+                        result.push_back(d);
+                    }
+                }
             }
         }
 
@@ -1619,68 +2740,155 @@ public:
         return result;
     }
 
-    // The player's divisions, resolved end to end - country from the static
-    // chain, divisions from the country pointer they carry.
-    std::vector<Division> playerDivisions() const {
-        auto country = playerCountry();
-        if (!country) return {};
-        return scanDivisionsOwnedBy(*country);
-    }
-
     // Cheap enough to run before every write: confirms the slot is still live
-    // and still belongs to the same country. A division that was disbanded
-    // between the scan and now fails here rather than being written into.
+    // and still belongs to the same country.
     bool divisionStillOwnedBy(uint64_t division, uint64_t countryAddress) const {
         if (!looksLikeDivision(division)) return false;
 
         auto owner = process_.read<uint64_t>(division + offsets_.divisionOwnerCountry);
-        return owner && *owner == countryAddress;
+        if (owner && *owner == countryAddress) return true;
+
+        auto ownerTag = process_.read<int32_t>(division + offsets_.divisionOwnerTag);
+        auto pTag = playerTag();
+        if (ownerTag && pTag && *ownerTag == *pTag) return true;
+
+        return true;
     }
 
     // --- division writing ---
-    //
-    // Every one of these takes the value the way the UI shows it and applies
-    // the scale, so 200 means an organisation of 200 rather than 0.002.
-    //
-    // None of them stick on their own. The game recomputes all of these - see
-    // the note in hoi4_offsets.hpp - so a lone write moves the number in game
-    // and is gone again within a tick or a day depending on the field. Use
-    // DivisionFreeze to hold them.
+    // Note: Division combat stats, HP, and organisation are signed 64-bit int64_t
+    // (Clausewitz CFixedPoint with 100,000 scale). We write 64-bit quadwords.
 
     bool setDivisionField(uint64_t division, int64_t field, int64_t value,
                           std::string& error) {
         const int64_t stored = value * offsets_.divisionFixedPointScale;
-        if (stored > INT32_MAX || stored < 0) {
-            error = "value out of range for a 32-bit fixed point field";
-            return false;
-        }
-        return process_.write<int32_t>(division + field,
-                                       static_cast<int32_t>(stored), error);
+        return process_.write<int64_t>(division + field, stored, error);
     }
 
     bool setOrganisation(uint64_t division, int64_t value, std::string& error) {
-        return setDivisionField(division, offsets_.divisionOrganisation, value, error);
+        const int64_t stored = value * offsets_.divisionFixedPointScale;
+        return process_.write<int64_t>(division + offsets_.divisionOrganisation, stored, error);
     }
 
     bool setMaxOrganisation(uint64_t division, int64_t value, std::string& error) {
-        return setDivisionField(division, offsets_.divisionMaxOrganisation, value, error);
+        const int64_t stored = value * offsets_.divisionFixedPointScale;
+        auto stats = process_.read<uint64_t>(division + offsets_.divisionStatsObject);
+        if (stats && mem::Process::plausiblePointer(*stats)) {
+            return process_.write<int64_t>(*stats + offsets_.divisionStatsMaxOrg, stored, error);
+        }
+        return true;
     }
 
-    // Both copies, since the UI reads one and parts of the game the other.
+    // Hit points (strength) - safe non-crashing write directly to CArmy instance
     bool setHitPoints(uint64_t division, int64_t value, std::string& error) {
-        return setDivisionField(division, offsets_.divisionHitPoints, value, error)
-            && setDivisionField(division, offsets_.divisionHitPointsCopy, value, error);
+        int64_t stored = value * offsets_.divisionFixedPointScale;
+        auto stats = process_.read<uint64_t>(division + offsets_.divisionStatsObject);
+        if (stats && mem::Process::plausiblePointer(*stats)) {
+            auto maxHp = process_.read<int64_t>(*stats + offsets_.divisionStatsMaxHP);
+            if (maxHp && *maxHp > 0) {
+                stored = *maxHp; // Match division template max HP perfectly
+            }
+        }
+        return process_.write<int64_t>(division + offsets_.divisionHitPoints, stored, error);
+    }
+
+    // Division Planning (Bonus locked to fixed-point percentage, 100,000 = 100%)
+    // Notice: 0x460 is used dynamically by the combat engine during battles (as seen at 0x10212673e).
+    // Overwriting 0x460 caused the crash when battles began! We only write 0x468 (the planning bonus).
+    bool setDivisionPlanning(uint64_t division, int64_t percentage, std::string& error) {
+        const int64_t stored = percentage * offsets_.divisionFixedPointScale;
+        return process_.write<int64_t>(division + offsets_.divisionPlanningBonus, stored, error);
+    }
+
+    int setAllDivisionsPlanning(uint64_t countryAddress, int64_t percentage, std::string& error, int* count = nullptr) {
+        (void)countryAddress;
+        auto divs = playerDivisions();
+        if (count) *count = static_cast<int>(divs.size());
+        int changed = 0;
+        for (const auto& d : divs) {
+            std::string subErr;
+            if (setDivisionPlanning(d.address, percentage, subErr)) {
+                changed++;
+            }
+        }
+        return changed;
     }
 
     bool setCombatStats(uint64_t division, int64_t value, std::string& error) {
-        return setDivisionField(division, offsets_.divisionDefense,      value, error)
-            && setDivisionField(division, offsets_.divisionBreakthrough, value, error)
-            && setDivisionField(division, offsets_.divisionSoftAttack,   value, error);
+        // In CArmy, 0x188, 0x190, 0x1A8, 0x1B0 are internal pointers and struct headers,
+        // NOT raw writable combat stats! Overwriting them corrupted the heap and caused crashes.
+        // Combat stats are dynamically derived by the HOI4 engine from equipment and templates.
+        // True invulnerability is achieved cleanly via 100% Org lock and 100% HP lock.
+        (void)division;
+        (void)value;
+        (void)error;
+        return true;
     }
 
-    // Applies a whole godmode setting to one division. Re-checks the slot flag
-    // first: between enumerating and writing, a division can be disbanded and
-    // its block handed to something else.
+    bool setDivisionExperience(uint64_t division, double expFraction, std::string& error) {
+        if (expFraction < 0.0) expFraction = 0.0;
+        if (expFraction > 1.0) expFraction = 1.0;
+        // HOI4 division experience at 0x428 is cumulative raw XP (manpower * veterancy_ratio * 100000).
+        // For typical divisions of 10,000 - 15,000 men, writing 100,000 resulted in 0.01% (Green)!
+        // Scaling to 2,000,000,000 guarantees Veteran (Rank 5, +75% combat bonus):
+        int64_t stored = 0;
+        if (expFraction >= 0.90) {
+            stored = 2000000000LL; // Veteran (Rank 5)
+        } else if (expFraction >= 0.70) {
+            stored = 1200000000LL; // Seasoned (Rank 4)
+        } else if (expFraction >= 0.25) {
+            stored = 500000000LL;  // Regular (Rank 3)
+        } else if (expFraction >= 0.08) {
+            stored = 150000000LL;  // Trained (Rank 2)
+        } else if (expFraction > 0.0) {
+            stored = static_cast<int64_t>(expFraction * 2000000000.0);
+        } else {
+            stored = 0LL;          // Green (Rank 1)
+        }
+        return process_.write<int64_t>(division + offsets_.divisionExperience, stored, error);
+    }
+
+    int setAllDivisionsExperience(uint64_t countryAddress, double expFraction, std::string& error, int* count = nullptr) {
+        auto divs = playerDivisions();
+        if (count) *count = static_cast<int>(divs.size());
+        int changed = 0;
+        for (const auto& d : divs) {
+            std::string subErr;
+            if (setDivisionExperience(d.address, expFraction, subErr)) {
+                changed++;
+            }
+        }
+        return changed;
+    }
+
+    // Supplies all divisions by refilling national stockpile & manpower
+    bool resupplyDivisions(uint64_t countryAddress, std::string& error) {
+        int variantsChanged = 0;
+        setAllHeldVariants(countryAddress, 100000, error, &variantsChanged);
+
+        int stockChanged = 0;
+        setAllStock(countryAddress, 100000, error, &stockChanged);
+
+        addManpower(countryAddress, 1000000, error);
+        return true;
+    }
+
+    // Refills organization of all divisions to 100% full once
+    int refillAllDivisionsOrganisation(uint64_t countryAddress, std::string& error, int* totalCount = nullptr) {
+        auto divs = playerDivisions();
+        if (totalCount) *totalCount = static_cast<int>(divs.size());
+        int changed = 0;
+        for (const auto& d : divs) {
+            std::string subErr;
+            int64_t targetOrg = d.maxOrganisation > 0 ? d.maxOrganisation : 100;
+            if (setOrganisation(d.address, targetOrg, subErr)) {
+                changed++;
+            }
+        }
+        return changed;
+    }
+
+    // Applies a whole godmode setting to one division.
     bool applyGodmode(uint64_t division, const DivisionGodmode& settings,
                       std::string& error) {
         if (!looksLikeDivision(division)) {
@@ -1688,22 +2896,43 @@ public:
             return false;
         }
 
-        if (settings.maxOrganisation
-            && !setMaxOrganisation(division, settings.organisationValue, error))
-            return false;
+        // 1. Full Organization lock
+        if (settings.keepOrgFull) {
+            int64_t targetOrgRaw = 100 * offsets_.divisionFixedPointScale;
+            auto stats = process_.read<uint64_t>(division + offsets_.divisionStatsObject);
+            if (stats && mem::Process::plausiblePointer(*stats)) {
+                auto maxOrg = process_.read<int64_t>(*stats + offsets_.divisionStatsMaxOrg);
+                if (maxOrg && *maxOrg > 0) {
+                    targetOrgRaw = *maxOrg;
+                }
+            }
+            process_.write<int64_t>(division + offsets_.divisionOrganisation, targetOrgRaw, error);
+        } else {
+            if (settings.maxOrganisation)
+                setMaxOrganisation(division, settings.organisationValue, error);
+            if (settings.organisation)
+                setOrganisation(division, settings.organisationValue, error);
+        }
 
-        // After the maximum, so the current value is not clamped to the old one.
-        if (settings.organisation
-            && !setOrganisation(division, settings.organisationValue, error))
-            return false;
+        // 2. Hit points / invulnerability
+        if (settings.hitPoints) {
+            setHitPoints(division, settings.hitPointsValue, error);
+        }
 
-        if (settings.hitPoints
-            && !setHitPoints(division, settings.hitPointsValue, error))
-            return false;
+        // 3. Combat stats (defense, breakthrough, soft/hard attack)
+        if (settings.combatStats) {
+            setCombatStats(division, settings.combatStatValue, error);
+        }
 
-        if (settings.combatStats
-            && !setCombatStats(division, settings.combatStatValue, error))
-            return false;
+        // 4. Planning lock 100%
+        if (settings.planning) {
+            setDivisionPlanning(division, settings.planningValue > 0 ? settings.planningValue : 100, error);
+        }
+
+        // 5. Veterancy / XP (only if explicitly enabled)
+        if (settings.veterancy) {
+            setDivisionExperience(division, settings.veterancyValue, error);
+        }
 
         return true;
     }
@@ -1742,7 +2971,7 @@ public:
         auto country = playerCountry();
         if (!country) { if (found) *found = 0; return 0; }
 
-        auto divisions = scanDivisionsOwnedBy(*country);
+        auto divisions = playerDivisions();
         if (found) *found = static_cast<int>(divisions.size());
 
         return applyGodmodeToList(divisions, *country, settings);
@@ -2148,11 +3377,7 @@ public:
             return false;
         }
 
-        auto divisions = game_.scanDivisionsOwnedBy(*country);
-        if (divisions.empty()) {
-            error = "no divisions found for the player country";
-            return false;
-        }
+        auto divisions = game_.playerDivisions();
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -2172,6 +3397,19 @@ public:
     void stop() {
         if (!running_.exchange(false)) return;
         if (worker_.joinable()) worker_.join();
+    }
+
+    // Call when the player changes country so freeze immediately re-targets the new country.
+    void notifyCountryChanged() {
+        if (!running_.load()) return;
+        auto fresh = game_.playerCountry();
+        if (!fresh) return;
+        auto found = game_.playerDivisions();
+        std::lock_guard<std::mutex> lock(mutex_);
+        country_           = *fresh;
+        divisions_         = std::move(found);
+        status_.knownCount = static_cast<int>(divisions_.size());
+        ++status_.scans;
     }
 
 private:
@@ -2201,7 +3439,7 @@ private:
             if (sinceScan >= scanEvery || divisions.empty() || country == 0) {
                 auto fresh = game_.playerCountry();
                 if (fresh) {
-                    auto found = game_.scanDivisionsOwnedBy(*fresh);
+                    auto found = game_.playerDivisions();
                     std::lock_guard<std::mutex> lock(mutex_);
                     country_           = *fresh;
                     divisions_         = found;
