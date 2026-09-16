@@ -120,23 +120,40 @@ public:
     bool writeBytes(uint64_t address, const void* src, size_t length, std::string& error) {
         mach_vm_address_t regionAddr = address;
         mach_vm_size_t    regionSize = 0;
-        vm_region_basic_info_data_64_t info;
-        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
-        mach_port_t objectName = MACH_PORT_NULL;
+        natural_t         depth = 0;
+        vm_region_submap_info_data_64_t info;
+        mach_msg_type_number_t count;
 
-        vm_prot_t original = VM_PROT_NONE;
+        vm_prot_t original = VM_PROT_READ | VM_PROT_EXECUTE;
         bool protectionChanged = false;
+        mach_vm_size_t pageSize = static_cast<mach_vm_size_t>(getpagesize());
+        if (pageSize < 4096) pageSize = 4096;
+        mach_vm_address_t pageStart = address & ~(pageSize - 1);
+        mach_vm_size_t pageLen = ((address + length + pageSize - 1) & ~(pageSize - 1)) - pageStart;
 
-        if (mach_vm_region(task_, &regionAddr, &regionSize, VM_REGION_BASIC_INFO_64,
-                reinterpret_cast<vm_region_info_t>(&info), &count, &objectName) == KERN_SUCCESS) {
+        while (true) {
+            count = VM_REGION_SUBMAP_INFO_COUNT_64;
+            kern_return_t kr = mach_vm_region_recurse(
+                task_, &regionAddr, &regionSize, &depth,
+                reinterpret_cast<vm_region_recurse_info_t>(&info), &count);
+            if (kr != KERN_SUCCESS) break;
+            if (info.is_submap) { depth++; continue; }
             original = info.protection;
-            if (!(original & VM_PROT_WRITE)) {
-                kern_return_t kp = mach_vm_protect(task_, address, length, FALSE,
-                                                   original | VM_PROT_WRITE);
-                if (kp != KERN_SUCCESS) {
-                    error = std::string("mach_vm_protect failed: ") + mach_error_string(kp);
-                    return false;
-                }
+            break;
+        }
+
+        if (!(original & VM_PROT_WRITE)) {
+            kern_return_t kp = mach_vm_protect(task_, pageStart, pageLen, FALSE,
+                                               original | VM_PROT_WRITE | VM_PROT_COPY);
+            if (kp != KERN_SUCCESS) {
+                kp = mach_vm_protect(task_, pageStart, pageLen, FALSE,
+                                    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+            }
+            if (kp != KERN_SUCCESS) {
+                kp = mach_vm_protect(task_, pageStart, pageLen, FALSE,
+                                    VM_PROT_READ | VM_PROT_WRITE);
+            }
+            if (kp == KERN_SUCCESS) {
                 protectionChanged = true;
             }
         }
@@ -147,7 +164,7 @@ public:
             static_cast<mach_msg_type_number_t>(length));
 
         if (protectionChanged)
-            mach_vm_protect(task_, address, length, FALSE, original);
+            mach_vm_protect(task_, pageStart, pageLen, FALSE, original);
 
         if (kw != KERN_SUCCESS) {
             error = std::string("mach_vm_write failed: ") + mach_error_string(kw);
